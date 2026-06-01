@@ -42,6 +42,9 @@ FastAPI + WebSocket backend with a dependency-free vanilla-JS dashboard.
   by real `torch.cuda.memory_allocated`, plus a smoothed per-token latency chart.
 - **Run history + compare** — every run is logged; pick any two to see a
   metric-delta table and a side-by-side output diff.
+- **Token confidence heatmap** — each generated token shaded by the model's
+  probability for it (green=confident → red=uncertain), surfacing where the model
+  was "deciding" vs. emitting boilerplate. HuggingFace engine.
 - **Event console** — raw server events (model load, prefill/TTFT, decode mode)
   streamed live.
 
