@@ -213,17 +213,24 @@
     <section class="card wide">
       <div class="card-head">
         <h2>Quantization tradeoff</h2>
-        <span class="tag">llama.cpp · GGUF ladder · CPU</span>
+        <span class="tag">size vs quality vs speed</span>
+        <label class="sweep-pick">engine
+          <select id="sweepEngine">
+            <option value="llamacpp">llama.cpp · CPU (full ladder)</option>
+            <option value="hf">HuggingFace · GPU (3-pt)</option>
+          </select>
+        </label>
         <label class="sweep-pick">model <select id="sweepModel"></select></label>
         <button id="sweepBtn" class="ghost mini">Run sweep</button>
       </div>
       <div class="why">
         <span class="q">Which quant is the best deal?</span>
-        Lower-bit quants are smaller and cheaper to read, but lose quality. This sweeps the
-        selected llama.cpp model's GGUF ladder (Q8→Q2) and measures <b>file size</b>,
-        <b>perplexity</b> (quality — lower is better), and <b>tok/s</b> on the CPU. The
-        <b>knee</b> of the size↔quality curve is the sweet spot (usually Q4_K_M).
-        <i>Slow — downloads + loads each level (Qwen ≈ 2 GB total; Phi is much larger).</i>
+        Lower-bit quants are smaller and cheaper to read, but can lose quality. Pick an engine:
+        <b>HuggingFace/GPU</b> sweeps FP16 / INT8 / 4-bit (3 points — bitsandbytes' only levels),
+        <b>llama.cpp/CPU</b> sweeps the full GGUF ladder (Q8→Q2 — the rich curve). It measures
+        <b>size</b>, <b>perplexity</b> (quality, lower is better) and <b>tok/s</b>, and marks the
+        best size↔quality point (the <b>knee</b>, usually Q4_K_M on GGUF).
+        <i>Slow — loads each level (GGUF also downloads; Phi is large).</i>
       </div>
       <div class="gen-grid">
         <div>

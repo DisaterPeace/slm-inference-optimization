@@ -561,15 +561,51 @@ def _perplexity(llm, text: str) -> float:
     return float(np.exp(-sum(lps) / len(lps))) if lps else 0.0
 
 
-@app.get("/api/quant_sweep")
-def quant_sweep(model_key: str = "qwen25_05b", include_fp: bool = False):
-    """Sweep a GGUF model's quant ladder, measuring the size/quality/speed tradeoff.
+def _quant_sweep_hf(model_key: str):
+    """HuggingFace/GPU quant tradeoff: FP16 / INT8 / 4-bit NF4 (the 3 levels bitsandbytes
+    offers). VRAM footprint (MB), perplexity from the logits, and decode tok/s. A coarse
+    3-point curve — and near-flat on a small model — vs. GGUF's fine ladder."""
+    tokenizer = get_tokenizer(model_key)
+    ids = tokenizer(_QUANT_SWEEP_REF, return_tensors="pt").input_ids.to(DEVICE)
+    labels = {"fp16": "FP16 · 16-bit (baseline)", "int8": "INT8 · 8-bit", "nf4": "NF4 · 4-bit"}
+    points = []
+    for prec in ("fp16", "int8", "nf4"):
+        try:
+            model = get_model(model_key, prec)
+        except Exception:
+            continue  # e.g. FP16 of a 3.8B model OOMs on 8 GB — just skip that point
+        size_mb = _footprint_mb.get((model_key, prec), 0.0)
+        with torch.no_grad():
+            logits = model(ids).logits[0, :-1].float()
+            lp = torch.log_softmax(logits, dim=-1)
+            tok_lp = lp[torch.arange(ids.shape[1] - 1), ids[0, 1:]]
+            ppl = float(torch.exp(-tok_lp.mean()))
+            t = time.perf_counter()
+            out = model.generate(ids, max_new_tokens=24, do_sample=False,
+                                 pad_token_id=tokenizer.eos_token_id)
+            dt = time.perf_counter() - t
+        ntok = out.shape[1] - ids.shape[1]
+        points.append({
+            "quant": prec, "label": labels[prec],
+            "size_mb": round(size_mb, 1), "ppl": round(ppl, 2),
+            "tps": round(ntok / dt, 1) if dt else 0.0,
+        })
+    return {"model": model_key, "model_label": _model_spec(model_key)["label"],
+            "engine": "hf", "points": points}
 
-    For each quant: file size (MB), perplexity on a fixed reference text (quality — lower
-    is better, computed directly from the logits), and decode throughput (tok/s). Runs on
-    CPU via llama.cpp; skips the 16-bit baselines by default. SLOW: downloads + loads each
-    level (FastAPI runs this sync endpoint in a threadpool, so it won't block the loop).
+
+@app.get("/api/quant_sweep")
+def quant_sweep(model_key: str = "qwen25_05b", engine: str = "llamacpp", include_fp: bool = False):
+    """Sweep a model's quant ladder, measuring the size/quality/speed tradeoff.
+
+    engine='hf'      → FP16/INT8/4-bit on the GPU (VRAM footprint + PPL + tok/s); 3 points.
+    engine='llamacpp'→ the full GGUF ladder on the CPU (file size + PPL + tok/s); the rich curve.
+
+    Perplexity is on a fixed reference text (lower = better), computed from the logits.
+    SLOW: downloads/loads each level. FastAPI runs this sync endpoint in a threadpool.
     """
+    if engine == "hf":
+        return _quant_sweep_hf(model_key)
     m = LLAMA_MODELS.get(model_key) or LLAMA_MODELS["qwen25_05b"]
     points = []
     for qkey, (label, _glob) in m["quants"].items():

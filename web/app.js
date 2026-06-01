@@ -628,9 +628,11 @@ function drawTradeoff() {
 }
 $("sweepBtn").addEventListener("click", () => {
   const model = $("sweepModel") ? $("sweepModel").value : "qwen25_05b";
+  const engine = $("sweepEngine") ? $("sweepEngine").value : "llamacpp";
   $("sweepBtn").disabled = true;
-  $("tradeNote").innerHTML = `running sweep on <b>${modelLabel(model)}</b> (CPU · downloads + loads each quant — may take a few minutes)…`;
-  fetch(`/api/quant_sweep?model_key=${model}`).then(r => r.json()).then(d => {
+  const where = engine === "hf" ? "GPU · loads FP16/INT8/4-bit" : "CPU · downloads + loads each GGUF quant";
+  $("tradeNote").innerHTML = `running ${engine === "hf" ? "HuggingFace" : "llama.cpp"} sweep on <b>${modelLabel(model)}</b> (${where} — may take a while)…`;
+  fetch(`/api/quant_sweep?model_key=${model}&engine=${engine}`).then(r => r.json()).then(d => {
     $("sweepBtn").disabled = false;
     tradePoints = d.points || [];
     drawTradeoff();
@@ -641,11 +643,13 @@ $("sweepBtn").addEventListener("click", () => {
       const b = tradePoints[bestTradeoff(tradePoints)];
       const big = tradePoints.reduce((a, p) => p.size_mb > a.size_mb ? p : a);
       const bestPpl = Math.min(...tradePoints.map(p => p.ppl));
+      const tail = engine === "hf"
+        ? `bitsandbytes only offers these 3 levels, and on a small model they're near-identical in quality — so <b>4-bit</b> is ~free memory savings. The fine knee needs GGUF (switch engine).`
+        : `Below the knee, perplexity climbs fast for little extra size savings — which is why <b>Q4_K_M</b> is the common default.`;
       $("tradeNote").innerHTML =
         `Best size↔quality tradeoff: <b style="color:#3fb950">${b.label}</b> ` +
         `— ${b.size_mb} MB at perplexity ${b.ppl} (lowest is ${bestPpl}), ${b.tps} tok/s. ` +
-        `That's <b>${(big.size_mb / b.size_mb).toFixed(1)}× smaller</b> than ${big.label}. ` +
-        `Below the knee, perplexity climbs fast for little extra size savings — which is why <b>Q4_K_M</b> is the common default.`;
+        `That's <b>${(big.size_mb / b.size_mb).toFixed(1)}× smaller</b> than ${big.label}. ` + tail;
     }
   }).catch(e => { $("sweepBtn").disabled = false; $("tradeNote").textContent = "Error: " + e; });
 });
