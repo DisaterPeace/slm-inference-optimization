@@ -27,8 +27,6 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from batching import measure_batched_throughput  # static-batching throughput sweep
-
 DEFAULT_MODEL_KEY = "qwen25_05b"
 MODEL_SPECS = {
     "qwen25_05b": {
@@ -629,31 +627,6 @@ def quant_sweep(model_key: str = "qwen25_05b", engine: str = "llamacpp", include
             "tps": round(ntok / dt, 1) if dt else 0.0,
         })
     return {"model": model_key, "model_label": m["label"], "points": points}
-
-
-_batching_cache: dict = {}
-
-
-@app.get("/api/batching")
-def batching(model_key: str = "qwen25_05b", precision: str = "fp16"):
-    """Static-batching throughput on the GPU: decode B sequences at once and report
-    tokens/sec + ms/step across batch sizes. Shows the 'shared weight read → throughput
-    scales' win that batching is built on. HuggingFace/GPU only — llama.cpp's library API
-    is single-stream, and *continuous* batching is a serving-engine (vLLM/TGI) scheduler."""
-    if DEVICE != "cuda":
-        return {"error": "static batching needs a GPU"}
-    key = (model_key, precision)
-    if key not in _batching_cache:
-        tokenizer = get_tokenizer(model_key)
-        model = get_model(model_key, precision)
-        _batching_cache[key] = measure_batched_throughput(model, tokenizer, DEVICE)
-    tp = _batching_cache[key]
-    base = tp[0]["tokens_per_sec"]
-    return {
-        "model": model_key, "precision": precision, "throughput": tp,
-        "speedup": round(tp[-1]["tokens_per_sec"] / base, 1) if base else 0,
-        "flat": round(tp[-1]["ms_per_step"] / tp[0]["ms_per_step"], 2) if tp[0]["ms_per_step"] else 0,
-    }
 
 
 # static frontend (mounted last so it doesn't shadow /api routes)
