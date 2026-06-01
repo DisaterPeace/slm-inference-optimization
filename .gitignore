@@ -15,6 +15,9 @@ results/
 *.log
 nanoserve-*.png
 
+# Local build toolchain (w64devkit) + build/sweep scratch
+tools/
+
 # Hugging Face cache (if ever placed locally)
 .cache/
 

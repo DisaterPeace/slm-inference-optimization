@@ -24,14 +24,20 @@ FastAPI + WebSocket backend with a dependency-free vanilla-JS dashboard.
   (deterministic) decoding so comparisons isolate the *optimization*, not
   sampling noise. A **Stop** button cancels generation server-side (worker
   thread + cooperative cancellation, so the GPU is freed immediately).
-- **Live, switchable optimizations** — **model** (0.5B / 3.8B), **quantization**
-  (FP16 / INT8 / 4-bit NF4 via bitsandbytes), and **KV cache** on/off, all
-  applied to the live run.
-- **Two A/B modes**:
+- **Two inference engines**, switchable:
+  - **HuggingFace (GPU)** — `transformers` + bitsandbytes; **quantization**
+    (FP16 / INT8 / 4-bit NF4), **KV cache** on/off, model (0.5B / 3.8B).
+  - **llama.cpp (CPU / GGUF)** — the edge / on-device path. GGUF quant ladder
+    **down to 2-bit (Q2_K)** — below what bitsandbytes can do — plus a
+    **mmap zero-copy vs. full-copy** load toggle (the "copy elimination" lever).
+- **Two A/B modes** (HuggingFace):
   - *cache on vs. off* — the O(N) vs. O(N²) decode divergence.
   - *optimized vs. baseline* — 4-bit + KV cache stacked against FP16 + no cache,
     reporting the combined speed **and** VRAM delta (honestly, even when the
-    "optimized" path is slower).
+    "optimized" path is slower on a small model).
+- **Quantization tradeoff graph** — sweep a GGUF model's whole quant ladder and
+  plot **size vs. perplexity vs. tok/s**, auto-identifying the best size↔quality
+  point (the "knee", usually Q4_K_M). Perplexity is computed directly from the logits.
 - **Live telemetry** — TTFT, TPOT, p50/p90/p99, tokens/sec, and a VRAM gauge fed
   by real `torch.cuda.memory_allocated`, plus a smoothed per-token latency chart.
 - **Run history + compare** — every run is logged; pick any two to see a
@@ -50,9 +56,10 @@ FastAPI + WebSocket backend with a dependency-free vanilla-JS dashboard.
 src/
   server.py            FastAPI app: WebSocket streaming generation with per-token
                        timing, greedy decoding, multi-turn chat, and live VRAM /
-                       event telemetry. Generation runs in a worker thread with
-                       cooperative cancellation so Stop frees the GPU and the
-                       event loop never blocks.
+                       event telemetry. Two engines (HuggingFace/GPU and
+                       llama.cpp/GGUF/CPU) + a /api/quant_sweep perplexity sweep.
+                       Generation runs in a worker thread with cooperative
+                       cancellation so Stop frees the GPU and the loop never blocks.
 web/
   index.html, app.js, style.css   Single-page dashboard (no framework).
 
@@ -83,6 +90,23 @@ python -m uvicorn server:app --app-dir src --port 8000
 
 The default model (`Qwen2.5-0.5B`) loads at startup. `Phi-4-mini-3.8B` loads on
 first use and should be run in **4-bit** to fit an 8 GB GPU.
+
+### Optional: the llama.cpp (CPU / GGUF) engine
+
+The CPU engine and the quantization-tradeoff sweep need `llama-cpp-python`. The
+prebuilt wheels assume **AVX-512**, which many consumer CPUs (e.g. Intel 12th/13th-gen)
+don't have — they crash with an illegal-instruction error. Build from source so it
+targets your CPU's actual instruction set (a C/C++ toolchain + CMake are required;
+on Windows a portable option is [w64devkit](https://github.com/skeeto/w64devkit)):
+
+```bash
+pip install cmake ninja
+# point CC/CXX at your compiler, then:
+CMAKE_ARGS="-DGGML_NATIVE=ON" pip install --no-binary llama-cpp-python llama-cpp-python
+```
+
+GGUF models download on first use from Hugging Face. CPU inference of a 0.5B model
+runs at ~15–18 tok/s — slow vs. GPU, but it's the point: **no GPU required** (edge).
 
 ## Key finding
 
