@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NanoServe — SLM Inference Test Bench</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <h1>NanoServe <span class="sub">SLM inference pipeline · live test bench</span></h1>
+    </div>
+    <div class="header-right">
+      <div id="device" class="device">connecting…</div>
+      <div id="deviceSub" class="device-sub"></div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ============ 1. SYSTEM CONTROL PANEL ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>System control panel</h2>
+        <span class="tag">configure the whole pipeline · then run</span>
+      </div>
+
+      <textarea id="prompt" rows="2" placeholder="Type a message… the conversation continues across turns (Clear &amp; start over to reset)">Explain how a CPU works, in detail.</textarea>
+
+      <div class="control-grid">
+        <label>Model
+          <select id="modelSelect">
+            <option value="qwen25_05b">Qwen2.5 0.5B</option>
+            <option value="phi4_mini">Phi-4 Mini 3.8B</option>
+          </select>
+        </label>
+
+        <label>Quantization
+          <select id="precision">
+            <option value="fp16">FP16 — baseline (full)</option>
+            <option value="int8">INT8 — LLM.int8() (real)</option>
+            <option value="nf4">4-bit NF4 — weight-only (real)</option>
+          </select>
+          <span class="ctrl-hint" id="precHint">real, runs live</span>
+        </label>
+
+        <label>Cache engine
+          <select id="cacheEngine">
+            <option value="kv">KV cache — reuse K/V · O(N)</option>
+            <option value="naive">Naive — recompute · O(N²)</option>
+          </select>
+          <span class="ctrl-hint">PagedAttention = how this is stored (grid below)</span>
+        </label>
+
+        <label>Memory load
+          <select id="memLoad">
+            <option value="pageable">Pageable — standard copy</option>
+            <option value="pinned">Pinned — zero-copy H2D</option>
+          </select>
+          <span class="ctrl-hint">real path · tiny at 1 tok (see benchmark)</span>
+        </label>
+
+        <label>Paged block size
+          <select id="blockSize">
+            <option value="8">8 tokens</option>
+            <option value="16" selected>16 tokens</option>
+            <option value="32">32 tokens</option>
+          </select>
+          <span class="ctrl-hint">drives the memory-page simulation</span>
+        </label>
+
+        <label>Max generation tokens
+          <input type="range" id="maxTokens" min="16" max="1024" step="16" value="256" />
+          <span id="maxTokensVal" class="pill">256</span>
+        </label>
+      </div>
+
+      <div class="btn-row">
+        <button id="runBtn" class="primary">▶ Send / run turn</button>
+        <button id="stopBtn" class="danger" disabled>■ Stop</button>
+        <button id="abBtn">Run A/B (cache on vs off)</button>
+        <button id="clearBtn" class="ghost">Clear &amp; start over</button>
+      </div>
+      <div id="runStatus" class="run-status"></div>
+
+      <div class="why">
+        <span class="q">What's real vs modeled here?</span>
+        <b>Model</b>, <b>quantization</b> (FP16/INT8/4-bit), <b>cache engine</b>, <b>memory load</b> (pinned vs pageable)
+        and <b>max tokens</b> change the <b>live</b> run on the GPU — every number below is measured. <b>PagedAttention</b> and the
+        <b>block-size</b> drive a faithful <b>simulation</b> of vLLM's memory allocator (real formulas, not a live
+        kernel — HuggingFace doesn't expose it). <b>AWQ/GPTQ/GGUF</b> appear in the quant panel as measured
+        size+error math on a real weight. Nothing here pretends to be something it isn't.
+      </div>
+
+      <div id="output" class="output"></div>
+    </section>
+
+    <!-- ============ 2. LIVE TELEMETRY MATRIX ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Live telemetry matrix</h2>
+        <span class="tag">measured on the GPU this run</span>
+      </div>
+      <div class="telemetry">
+        <div class="readout"><div class="ro-label">TTFT</div><div id="tmTTFT" class="ro-val">–<span class="ro-unit">ms</span></div><div class="ro-sub">time to first token (prefill)</div></div>
+        <div class="readout"><div class="ro-label">TPOT</div><div id="tmTPOT" class="ro-val">–<span class="ro-unit">ms</span></div><div class="ro-sub">avg time per output token</div></div>
+        <div class="readout"><div class="ro-label">Throughput</div><div id="tmTPS" class="ro-val">–<span class="ro-unit">tok/s</span></div><div class="ro-sub">1000 / TPOT</div></div>
+        <div class="readout"><div class="ro-label">Tokens</div><div id="tmTokens" class="ro-val">–</div><div class="ro-sub">prompt + generated</div></div>
+        <div class="readout gauge-box">
+          <div class="ro-label">VRAM allocated <span class="hint">live torch reading</span></div>
+          <div class="gauge"><div id="vramGaugeFill" class="gauge-fill"></div></div>
+          <div id="vramGaugeLabel" class="ro-sub">–</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 3. PER-TOKEN LATENCY GRAPH ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Per-token latency</h2>
+        <span class="tag">token # vs ms · runs overlay so you can compare</span>
+      </div>
+      <div class="why">
+        <span class="q">Why the KV cache?</span>
+        To write each new token the model looks back at <b>every</b> earlier token. Without a cache it re-reads the
+        whole sequence each step — O(N²) work that grows with length. The KV cache stores each token's Key/Value once
+        and reuses it, so each step handles only the new token (O(N)). Run the pipeline with the cache engine set to
+        <b>Naive</b>, then again with <b>KV cache</b>: the red curve climbs, the green stays flat. The gap widens with
+        sequence length and model size.
+      </div>
+      <div class="gen-grid">
+        <div>
+          <h3>Latency curve <span class="hint">faint = raw · bold = smoothed trend</span></h3>
+          <canvas id="latChart" width="480" height="240"></canvas>
+          <div id="legend" class="legend"></div>
+        </div>
+        <div>
+          <h3>Run statistics</h3>
+          <div class="table-wrap">
+            <table id="statTable" class="stat-table">
+              <thead>
+                <tr>
+                  <th>run</th>
+                  <th title="Time To First Token — the prefill pass over your prompt. Same work with or without KV cache.">TTFT</th>
+                  <th title="Time Per Output Token — avg ms per token after the first. This is what the KV cache improves.">TPOT</th>
+                  <th title="Median per-token latency.">p50</th>
+                  <th title="90th-percentile per-token latency.">p90</th>
+                  <th title="99th-percentile (tail) latency — worst-case stutter. Production SLAs target tail latency.">p99</th>
+                  <th title="Throughput = 1000 / TPOT.">tok/s</th>
+                  <th title="Total wall time, prompt + all tokens.">total</th>
+                </tr>
+              </thead>
+              <tbody id="statBody">
+                <tr class="empty"><td colspan="8">no runs yet — hit Run inference pipeline</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div id="speedupNote" class="note"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 4. PHYSICAL MEMORY PAGE GRID ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Physical memory page grid</h2>
+        <span class="tag sim">SIMULATION · vLLM PagedAttention allocator</span>
+      </div>
+      <div class="why">
+        <span class="q">Why PagedAttention?</span>
+        The KV cache lives in GPU memory and grows with every token <b>and</b> every concurrent user. The naive way
+        reserves max-length memory per request up front — but most requests are short, so most of that sits
+        <b>empty and wasted</b>. Wasted memory = fewer users per GPU. PagedAttention hands out memory in small fixed
+        <b>blocks</b> on demand, like an OS paging RAM. This grid is a faithful simulation of that allocator (real KV
+        byte math for the selected model + block size) — HuggingFace can't run the real kernel, vLLM can.
+      </div>
+      <div class="headline"><span id="pagedHero" class="hero">–</span><span class="hero-sub">less KV memory vs naive reservation</span></div>
+      <div class="row">
+        <label>Request lengths (tokens)
+          <input type="text" id="lengths" value="40,55,60,80,120,150,200,300,512,900" />
+        </label>
+        <label>Reserve/req <input type="number" id="maxLen" value="2048" style="width:80px" /></label>
+        <button id="pagedBtn">Compute</button>
+      </div>
+      <div id="pagedBars" class="bars"></div>
+      <p class="caption">Each cell = one KV block. <span class="used">used</span> vs <span class="wasted">reserved-but-wasted</span>.</p>
+      <div id="blockGrid" class="block-grid"></div>
+      <div id="pagedNote" class="note"></div>
+    </section>
+
+    <!-- ============ 5. HARDWARE TERMINAL CONSOLE ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Hardware terminal console</h2>
+        <span class="tag">raw events streamed from the server</span>
+        <button id="consoleClear" class="ghost mini">clear</button>
+      </div>
+      <div id="consoleLog" class="console"></div>
+    </section>
+
+    <!-- ============ RUN HISTORY ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Run history</h2>
+        <span class="tag">newest first · compare every setting you tried</span>
+      </div>
+      <div class="table-wrap">
+        <table class="stat-table">
+          <thead>
+            <tr>
+              <th>#</th><th>config</th><th>tokens</th>
+              <th>TTFT</th><th>TPOT</th><th>p99</th><th>tok/s</th><th>total</th>
+            </tr>
+          </thead>
+          <tbody id="historyBody">
+            <tr class="empty"><td colspan="8">runs you make will be logged here</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ============ DEEP-DIVE: QUANTIZATION ============ -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Quantization</h2>
+        <span class="tag">measured on a real weight · AWQ/GPTQ/GGUF modeled</span>
+      </div>
+      <div class="why">
+        <span class="q">Why quantize & dequantize?</span>
+        Weights are normally 16-bit floats — a 7B model is ~14 GB, and <b>every token</b> must stream all of them out
+        of memory (the decode bottleneck). Storing them in fewer bits makes the model smaller and cheaper to read, for
+        an accuracy cost (the % error below). <b>Dequantization</b> is the reverse step before each multiply: the packed
+        ints are expanded back to float using the stored scale + zero-point. <b>Compress to store, decompress to
+        compute.</b> INT8/4-bit run live above; INT2 (GGUF-style) and the INT4 grouping (AWQ/GPTQ-style) are measured
+        here on a real weight matrix.
+      </div>
+      <div class="headline"><span id="quantHero" class="hero">–</span><span class="hero-sub">smaller weights at <span id="quantHeroErr">–</span> error</span></div>
+      <div class="row">
+        <label>Group size
+          <select id="groupSize">
+            <option value="32">32 — least error, most overhead</option>
+            <option value="64">64</option>
+            <option value="128" selected>128 — vLLM/AWQ default</option>
+            <option value="448">448 — largest for this weight</option>
+          </select>
+        </label>
+        <button id="quantBtn">Measure</button>
+        <span class="hint">← group size = accuracy vs memory tradeoff</span>
+      </div>
+      <div id="quantBars" class="bars"></div>
+      <div id="vramBars" class="bars"></div>
+      <div id="quantNote" class="note"></div>
+    </section>
+
+    <!-- ============ DEEP-DIVE: CONTINUOUS BATCHING ============ -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Continuous batching &amp; concurrency</h2>
+        <span class="tag">throughput · how real servers scale</span>
+      </div>
+      <div class="why">
+        <span class="q">Why batching?</span>
+        One decode step barely uses the GPU — almost all its time goes to reading the model's weights out of memory,
+        not to math. Decode <b>many requests at once</b> and they <b>share that one weight read</b> — far more tokens
+        for nearly the same time per step. That's continuous batching, the biggest throughput trick in vLLM/TGI. How
+        many you can batch is capped by KV memory — exactly what PagedAttention frees up.
+      </div>
+      <div class="headline"><span id="batchHero" class="hero">–</span><span class="hero-sub">more tokens/sec at batch 16 vs batch 1 — for almost the same latency per step</span></div>
+      <div>
+        <h3>Decode throughput vs batch size <span class="hint">measured live</span></h3>
+        <button id="batchBtn">Run batching benchmark</button>
+        <div id="batchBars" class="bars"></div>
+        <div id="batchNote" class="note"></div>
+      </div>
+      <div>
+        <h3>Concurrent requests that fit in KV memory <span class="hint">naive vs paging</span></h3>
+        <div class="row">
+          <label>Avg length <input type="number" id="capAvg" value="180" style="width:70px" /></label>
+          <label>Max/req <input type="number" id="capMax" value="2048" style="width:80px" /></label>
+          <label>KV budget (GB) <input type="number" id="capBudget" value="4" style="width:60px" /></label>
+        </div>
+        <div id="capBars" class="bars"></div>
+        <div id="capNote" class="note"></div>
+      </div>
+    </section>
+
+    <!-- ============ DEEP-DIVE: ZERO-COPY ============ -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Zero-copy transfers</h2>
+        <span class="tag">pinned vs pageable memory</span>
+      </div>
+      <div class="why">
+        <span class="q">Why zero-copy?</span>
+        Data travels from CPU RAM to GPU VRAM over PCIe. Ordinary (<b>pageable</b>) memory can be moved by the OS, so
+        the GPU can't grab it directly — it forces a slow extra copy through a staging buffer. <b>Pinned</b> memory is
+        locked in place, so the GPU pulls it straight across. Same principle in the decode loop: every
+        <code>.item()</code> sync makes the GPU wait on the CPU. Fewer copies and syncs = more time computing.
+      </div>
+      <div class="headline"><span id="zcHero" class="hero">–</span><span class="hero-sub">faster host→device with pinned memory</span></div>
+      <button id="zcBtn">Run transfer benchmark</button>
+      <div id="zcBars" class="bars"></div>
+      <div id="zcNote" class="note"></div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
