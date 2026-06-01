@@ -1,44 +1,43 @@
 # NanoServe — SLM Inference Optimization Test Bench
 
-A local, interactive test bench for exploring the optimizations that make small
-language model (SLM) inference fast and memory-efficient — KV caching,
-weight quantization, continuous batching, PagedAttention memory layout, and
-host↔device transfer paths — with **live, measured** telemetry on every run.
+An interactive playground for tuning small-language-model (SLM) inference and
+**seeing exactly what each optimization changes** — quantization (FP16 / INT8 /
+4-bit) and KV caching applied live, with every latency and memory number measured
+on the GPU, and any two runs diffable side by side.
 
 Built around `Qwen2.5-0.5B-Instruct` and `Phi-4-mini-3.8B`, served through a
 FastAPI + WebSocket backend with a dependency-free vanilla-JS dashboard.
 
-> **Design principle: measure honestly, label clearly.**
-> Some optimizations (KV cache on/off, FP16/INT8/4-bit quantization, the
-> transfer path) genuinely change the live forward pass and every number is
-> measured on the GPU. Others — notably PagedAttention — are vLLM kernel-level
-> features that HuggingFace does not expose, so they are reproduced as a
-> **faithful memory-model simulation** (real KV byte math, clearly labelled as
-> such in the UI) rather than faked into the live path. Knowing which is which
-> is the point.
+> **Design principle: measure honestly, label clearly.** Every knob in the UI
+> changes the *live* forward pass and every metric is measured on the GPU.
+> LLM decode is **memory-bandwidth-bound**, so the playground is built to reveal
+> *where each optimization does and doesn't pay off* — including honest results
+> like "4-bit buys memory, not speed, on a small model." Engine-level techniques
+> that HuggingFace doesn't expose (PagedAttention, fused kernels) are named as
+> such rather than faked.
 
 ---
 
 ## Features
 
-- **Live generation** with per-token latency streamed over WebSocket
-  (TTFT, TPOT, p50/p90/p99, tokens/sec).
-- **A/B benchmarking**: run the same prompt with the KV cache on vs. off and
-  see the O(N) vs. O(N²) divergence as the smoothed latency curves separate.
-- **Quantization**, switchable per run:
-  - **FP16 / INT8 / 4-bit (NF4)** load and run *live* via bitsandbytes.
-  - **INT8 / INT4 (AWQ/GPTQ-style group) / INT2 (GGUF-style)** size-and-error
-    are computed from scratch on a real weight matrix.
-- **Continuous batching** throughput sweep (batch 1→16) showing why shared
-  weight reads give near-free throughput scaling.
-- **PagedAttention memory simulation**: a block allocator + page grid showing
-  reserved-but-wasted vs. used KV memory, and the resulting concurrency
-  capacity, for a chosen block size.
-- **Zero-copy transfers**: pinned vs. pageable host→device bandwidth benchmark,
-  plus a real pinned-buffer decode path you can toggle.
-- **Multi-turn chat** with full conversation context, a **Stop** button that
-  actually cancels generation server-side, and a live **VRAM gauge** and
-  **event console** fed by real `torch.cuda` readings.
+- **Chat playground** — multi-turn conversation with full context, greedy
+  (deterministic) decoding so comparisons isolate the *optimization*, not
+  sampling noise. A **Stop** button cancels generation server-side (worker
+  thread + cooperative cancellation, so the GPU is freed immediately).
+- **Live, switchable optimizations** — **model** (0.5B / 3.8B), **quantization**
+  (FP16 / INT8 / 4-bit NF4 via bitsandbytes), and **KV cache** on/off, all
+  applied to the live run.
+- **Two A/B modes**:
+  - *cache on vs. off* — the O(N) vs. O(N²) decode divergence.
+  - *optimized vs. baseline* — 4-bit + KV cache stacked against FP16 + no cache,
+    reporting the combined speed **and** VRAM delta (honestly, even when the
+    "optimized" path is slower).
+- **Live telemetry** — TTFT, TPOT, p50/p90/p99, tokens/sec, and a VRAM gauge fed
+  by real `torch.cuda.memory_allocated`, plus a smoothed per-token latency chart.
+- **Run history + compare** — every run is logged; pick any two to see a
+  metric-delta table and a side-by-side output diff.
+- **Event console** — raw server events (model load, prefill/TTFT, decode mode)
+  streamed live.
 
 ## Tech stack
 
@@ -49,17 +48,23 @@ FastAPI + WebSocket backend with a dependency-free vanilla-JS dashboard.
 
 ```
 src/
-  server.py            FastAPI app: WebSocket streaming generation + REST endpoints.
-                       Generation runs in a worker thread with cooperative
-                       cancellation so Stop frees the GPU and the event loop
-                       never blocks.
-  quantization.py      From-scratch symmetric INT8 and affine n-bit group
-                       quantization / dequantization (the AWQ/GPTQ scheme).
-  paged_attention.py   KV-cache byte math + PagedAttention block-allocator model.
-  zero_copy.py         Pinned vs. pageable host↔device transfer timing.
-  batching.py          Batched-decode throughput + concurrency-capacity model.
+  server.py            FastAPI app: WebSocket streaming generation with per-token
+                       timing, greedy decoding, multi-turn chat, and live VRAM /
+                       event telemetry. Generation runs in a worker thread with
+                       cooperative cancellation so Stop frees the GPU and the
+                       event loop never blocks.
 web/
   index.html, app.js, style.css   Single-page dashboard (no framework).
+
+src/  (reference implementations — standalone studies of each technique,
+       runnable directly with `python <file>`; not imported by the server)
+  quantization.py      From-scratch symmetric INT8 and affine n-bit group
+                       quantization / dequantization (the AWQ/GPTQ scheme),
+                       measured on a real weight matrix.
+  paged_attention.py   KV-cache byte math + a PagedAttention block-allocator model
+                       (used-vs-wasted memory, concurrency capacity).
+  zero_copy.py         Pinned vs. pageable host↔device transfer timing.
+  batching.py          Batched-decode throughput + concurrency-capacity model.
 ```
 
 ## Running it
@@ -83,11 +88,13 @@ first use and should be run in **4-bit** to fit an 8 GB GPU.
 
 On small models served single-stream, decode is **overhead/bandwidth-bound**,
 not compute-bound: each step is dominated by streaming the model weights out of
-VRAM, so the KV cache shows a modest (~1.2×) speedup and pinned-memory transfers
-are negligible (you move ~8 bytes/token across PCIe). The same techniques scale
-dramatically with model size and concurrency — which is exactly what the
-batching and PagedAttention panels make visible. The test bench is built to show
-*where* each optimization does and does not pay off, with the numbers to back it.
+VRAM. So the KV cache shows only a modest (~1.2×) speedup, and **4-bit
+quantization buys ~2.2× less VRAM but no speed** (bitsandbytes adds dequant
+overhead) — both visible directly in the *optimized vs. baseline* A/B. The same
+techniques scale dramatically with model size and concurrency. The whole point of
+the bench is to show *where* each optimization does and doesn't pay off, with the
+measured numbers to back it — which is a more useful answer than assuming every
+"optimization" is always a win.
 
 ## Hardware
 
