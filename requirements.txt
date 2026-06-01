@@ -1,0 +1,14 @@
+# torch is installed separately with the cu128 index (Blackwell / sm_120):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+transformers>=4.49.0
+tokenizers
+accelerate
+safetensors
+numpy
+
+# Live weight quantization (INT8 / 4-bit NF4)
+bitsandbytes
+
+# Inference server
+fastapi
+uvicorn[standard]

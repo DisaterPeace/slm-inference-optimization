@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Local tooling / editor
+.claude/
+.vscode/
+.idea/
+
+# Generated artifacts, benchmarks output, logs
+results/
+*.log
+nanoserve-*.png
+
+# Hugging Face cache (if ever placed locally)
+.cache/
+
+# Learning scaffolding — kept locally for reference, not part of the product.
+# (standalone step-by-step demos that the production server does not import)
+src/phase0_naive.py
+src/phase1_kvcache.py
+src/phase2_bnb.py
+src/bench.py
+src/bench_compare.py
+src/make_dashboard.py
+docs/fpga_design.md
