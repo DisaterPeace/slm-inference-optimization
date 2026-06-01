@@ -25,6 +25,9 @@
         <span class="tag">configure the whole pipeline · then run</span>
       </div>
 
+      <input id="system" class="system-input" type="text"
+             placeholder="System prompt (optional) — e.g. You are a terse expert. Answer in one paragraph." />
+
       <textarea id="prompt" rows="2" placeholder="Type a message… the conversation continues across turns (Clear &amp; start over to reset)">Explain how a CPU works, in detail.</textarea>
 
       <div class="control-grid">
@@ -49,24 +52,7 @@
             <option value="kv">KV cache — reuse K/V · O(N)</option>
             <option value="naive">Naive — recompute · O(N²)</option>
           </select>
-          <span class="ctrl-hint">PagedAttention = how this is stored (grid below)</span>
-        </label>
-
-        <label>Memory load
-          <select id="memLoad">
-            <option value="pageable">Pageable — standard copy</option>
-            <option value="pinned">Pinned — zero-copy H2D</option>
-          </select>
-          <span class="ctrl-hint">real path · tiny at 1 tok (see benchmark)</span>
-        </label>
-
-        <label>Paged block size
-          <select id="blockSize">
-            <option value="8">8 tokens</option>
-            <option value="16" selected>16 tokens</option>
-            <option value="32">32 tokens</option>
-          </select>
-          <span class="ctrl-hint">drives the memory-page simulation</span>
+          <span class="ctrl-hint">reuse vs recompute past tokens</span>
         </label>
 
         <label>Max generation tokens
@@ -78,18 +64,19 @@
       <div class="btn-row">
         <button id="runBtn" class="primary">▶ Send / run turn</button>
         <button id="stopBtn" class="danger" disabled>■ Stop</button>
-        <button id="abBtn">Run A/B (cache on vs off)</button>
+        <button id="abBtn">A/B: cache on vs off</button>
+        <button id="optBtn">A/B: optimized vs baseline</button>
         <button id="clearBtn" class="ghost">Clear &amp; start over</button>
       </div>
       <div id="runStatus" class="run-status"></div>
 
       <div class="why">
-        <span class="q">What's real vs modeled here?</span>
-        <b>Model</b>, <b>quantization</b> (FP16/INT8/4-bit), <b>cache engine</b>, <b>memory load</b> (pinned vs pageable)
-        and <b>max tokens</b> change the <b>live</b> run on the GPU — every number below is measured. <b>PagedAttention</b> and the
-        <b>block-size</b> drive a faithful <b>simulation</b> of vLLM's memory allocator (real formulas, not a live
-        kernel — HuggingFace doesn't expose it). <b>AWQ/GPTQ/GGUF</b> appear in the quant panel as measured
-        size+error math on a real weight. Nothing here pretends to be something it isn't.
+        <span class="q">How to use this</span>
+        Change the <b>model</b>, <b>quantization</b> (FP16 / INT8 / 4-bit) or <b>cache engine</b>, send a prompt, and
+        watch what changes — in the <b>output</b> and in the <b>measured metrics</b> below. Decoding is greedy
+        (deterministic) so a comparison isolates the <i>optimization</i>, not sampling noise.
+        <b>A/B: cache on vs off</b> isolates the KV cache; <b>A/B: optimized vs baseline</b> stacks 4-bit + KV cache
+        against plain FP16 with no cache. Every run is logged and comparable. All numbers measured live on the GPU.
       </div>
 
       <div id="output" class="output"></div>
@@ -160,35 +147,7 @@
       </div>
     </section>
 
-    <!-- ============ 4. PHYSICAL MEMORY PAGE GRID ============ -->
-    <section class="card wide">
-      <div class="card-head">
-        <h2>Physical memory page grid</h2>
-        <span class="tag sim">SIMULATION · vLLM PagedAttention allocator</span>
-      </div>
-      <div class="why">
-        <span class="q">Why PagedAttention?</span>
-        The KV cache lives in GPU memory and grows with every token <b>and</b> every concurrent user. The naive way
-        reserves max-length memory per request up front — but most requests are short, so most of that sits
-        <b>empty and wasted</b>. Wasted memory = fewer users per GPU. PagedAttention hands out memory in small fixed
-        <b>blocks</b> on demand, like an OS paging RAM. This grid is a faithful simulation of that allocator (real KV
-        byte math for the selected model + block size) — HuggingFace can't run the real kernel, vLLM can.
-      </div>
-      <div class="headline"><span id="pagedHero" class="hero">–</span><span class="hero-sub">less KV memory vs naive reservation</span></div>
-      <div class="row">
-        <label>Request lengths (tokens)
-          <input type="text" id="lengths" value="40,55,60,80,120,150,200,300,512,900" />
-        </label>
-        <label>Reserve/req <input type="number" id="maxLen" value="2048" style="width:80px" /></label>
-        <button id="pagedBtn">Compute</button>
-      </div>
-      <div id="pagedBars" class="bars"></div>
-      <p class="caption">Each cell = one KV block. <span class="used">used</span> vs <span class="wasted">reserved-but-wasted</span>.</p>
-      <div id="blockGrid" class="block-grid"></div>
-      <div id="pagedNote" class="note"></div>
-    </section>
-
-    <!-- ============ 5. HARDWARE TERMINAL CONSOLE ============ -->
+    <!-- ============ 4. HARDWARE TERMINAL CONSOLE ============ -->
     <section class="card wide">
       <div class="card-head">
         <h2>Hardware terminal console</h2>
@@ -219,89 +178,21 @@
       </div>
     </section>
 
-    <!-- ============ DEEP-DIVE: QUANTIZATION ============ -->
-    <section class="card">
+    <!-- ============ COMPARE RUNS ============ -->
+    <section class="card wide">
       <div class="card-head">
-        <h2>Quantization</h2>
-        <span class="tag">measured on a real weight · AWQ/GPTQ/GGUF modeled</span>
+        <h2>Compare runs</h2>
+        <span class="tag">pick two runs · see exactly what each setting changed</span>
       </div>
-      <div class="why">
-        <span class="q">Why quantize & dequantize?</span>
-        Weights are normally 16-bit floats — a 7B model is ~14 GB, and <b>every token</b> must stream all of them out
-        of memory (the decode bottleneck). Storing them in fewer bits makes the model smaller and cheaper to read, for
-        an accuracy cost (the % error below). <b>Dequantization</b> is the reverse step before each multiply: the packed
-        ints are expanded back to float using the stored scale + zero-point. <b>Compress to store, decompress to
-        compute.</b> INT8/4-bit run live above; INT2 (GGUF-style) and the INT4 grouping (AWQ/GPTQ-style) are measured
-        here on a real weight matrix.
-      </div>
-      <div class="headline"><span id="quantHero" class="hero">–</span><span class="hero-sub">smaller weights at <span id="quantHeroErr">–</span> error</span></div>
       <div class="row">
-        <label>Group size
-          <select id="groupSize">
-            <option value="32">32 — least error, most overhead</option>
-            <option value="64">64</option>
-            <option value="128" selected>128 — vLLM/AWQ default</option>
-            <option value="448">448 — largest for this weight</option>
-          </select>
-        </label>
-        <button id="quantBtn">Measure</button>
-        <span class="hint">← group size = accuracy vs memory tradeoff</span>
+        <label>Run A <select id="cmpA"></select></label>
+        <label>Run B <select id="cmpB"></select></label>
       </div>
-      <div id="quantBars" class="bars"></div>
-      <div id="vramBars" class="bars"></div>
-      <div id="quantNote" class="note"></div>
+      <div class="table-wrap"><div id="cmpTable"></div></div>
+      <div id="cmpOutputs" class="cmp-outputs"></div>
+      <div id="cmpEmpty" class="note">Make at least two runs (change a setting between them) to compare here.</div>
     </section>
 
-    <!-- ============ DEEP-DIVE: CONTINUOUS BATCHING ============ -->
-    <section class="card">
-      <div class="card-head">
-        <h2>Continuous batching &amp; concurrency</h2>
-        <span class="tag">throughput · how real servers scale</span>
-      </div>
-      <div class="why">
-        <span class="q">Why batching?</span>
-        One decode step barely uses the GPU — almost all its time goes to reading the model's weights out of memory,
-        not to math. Decode <b>many requests at once</b> and they <b>share that one weight read</b> — far more tokens
-        for nearly the same time per step. That's continuous batching, the biggest throughput trick in vLLM/TGI. How
-        many you can batch is capped by KV memory — exactly what PagedAttention frees up.
-      </div>
-      <div class="headline"><span id="batchHero" class="hero">–</span><span class="hero-sub">more tokens/sec at batch 16 vs batch 1 — for almost the same latency per step</span></div>
-      <div>
-        <h3>Decode throughput vs batch size <span class="hint">measured live</span></h3>
-        <button id="batchBtn">Run batching benchmark</button>
-        <div id="batchBars" class="bars"></div>
-        <div id="batchNote" class="note"></div>
-      </div>
-      <div>
-        <h3>Concurrent requests that fit in KV memory <span class="hint">naive vs paging</span></h3>
-        <div class="row">
-          <label>Avg length <input type="number" id="capAvg" value="180" style="width:70px" /></label>
-          <label>Max/req <input type="number" id="capMax" value="2048" style="width:80px" /></label>
-          <label>KV budget (GB) <input type="number" id="capBudget" value="4" style="width:60px" /></label>
-        </div>
-        <div id="capBars" class="bars"></div>
-        <div id="capNote" class="note"></div>
-      </div>
-    </section>
-
-    <!-- ============ DEEP-DIVE: ZERO-COPY ============ -->
-    <section class="card">
-      <div class="card-head">
-        <h2>Zero-copy transfers</h2>
-        <span class="tag">pinned vs pageable memory</span>
-      </div>
-      <div class="why">
-        <span class="q">Why zero-copy?</span>
-        Data travels from CPU RAM to GPU VRAM over PCIe. Ordinary (<b>pageable</b>) memory can be moved by the OS, so
-        the GPU can't grab it directly — it forces a slow extra copy through a staging buffer. <b>Pinned</b> memory is
-        locked in place, so the GPU pulls it straight across. Same principle in the decode loop: every
-        <code>.item()</code> sync makes the GPU wait on the CPU. Fewer copies and syncs = more time computing.
-      </div>
-      <div class="headline"><span id="zcHero" class="hero">–</span><span class="hero-sub">faster host→device with pinned memory</span></div>
-      <button id="zcBtn">Run transfer benchmark</button>
-      <div id="zcBars" class="bars"></div>
-      <div id="zcNote" class="note"></div>
-    </section>
   </main>
 
   <script src="/app.js"></script>

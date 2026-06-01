@@ -29,7 +29,6 @@ function applyModelInfo(d) {
     if (active.nf4_mb) parts.push(`NF4 ${active.nf4_mb.toFixed(0)} MB`);
     $("deviceSub").textContent = parts.join(" · ");
   }
-  renderVram(d);
 }
 function refreshModelInfo() {
   return fetch("/api/model_info")
@@ -144,11 +143,11 @@ function runGeneration(cfg, onToken) {
     ws.onopen = () => ws.send(JSON.stringify({
       prompt: cfg.prompt,
       messages: cfg.messages,            // multi-turn history (optional)
+      system: cfg.system,
       max_new_tokens: cfg.maxTokens,
       use_cache: cfg.useCache,
       precision: cfg.precision,
       model: cfg.model,
-      pinned: cfg.pinned,
     }));
 
     ws.onmessage = (ev) => {
@@ -238,34 +237,88 @@ function setStatTable(runs) {
   }).join("");
 }
 let historyCount = 0;
+let runLog = [];  // full record of each run, for the Compare panel
+function configLabel(cfg, label) {
+  return `${modelLabel(cfg.model)} · ${cfg.precision.toUpperCase()} · ${label}`;
+}
 function logHistory(label, cfg, r) {
   historyCount++;
+  const cl = configLabel(cfg, label) + (r.aborted ? " · stopped" : "");
+  runLog.push({ n: historyCount, configLabel: cl, cfg, r });
   const body = $("historyBody");
   if (body.querySelector(".empty")) body.innerHTML = "";
   const s = r.stats;
   const row = document.createElement("tr");
   row.innerHTML = `
     <td>${historyCount}</td>
-    <td>${modelLabel(cfg.model)} · ${cfg.precision.toUpperCase()} · ${label}${r.aborted ? " · stopped" : ""}</td>
+    <td>${cl}</td>
     <td>${r.promptTokens != null ? r.promptTokens : "?"}+${r.generated}</td>
     <td>${s.ttft.toFixed(0)} ms</td><td>${s.tpot.toFixed(1)} ms</td>
     <td>${s.p99.toFixed(1)} ms</td><td>${s.toks.toFixed(1)}</td><td>${(s.total / 1000).toFixed(2)}s</td>`;
   body.insertBefore(row, body.firstChild);
+  refreshCompareOptions();
 }
+
+// ---------- COMPARE RUNS ----------
+function refreshCompareOptions() {
+  if (runLog.length < 2) { $("cmpEmpty").style.display = ""; return; }
+  $("cmpEmpty").style.display = "none";
+  const opts = runLog.map(x => `<option value="${x.n}">#${x.n} · ${x.configLabel}</option>`).join("");
+  $("cmpA").innerHTML = opts;
+  $("cmpB").innerHTML = opts;
+  $("cmpA").value = runLog[runLog.length - 2].n;  // previous run
+  $("cmpB").value = runLog[runLog.length - 1].n;  // latest run
+  renderCompare();
+}
+function cmpRow(name, a, b, lowerBetter, unit, digits) {
+  const delta = b - a;
+  const same = Math.abs(delta) < Math.pow(10, -digits) / 2;
+  const better = lowerBetter ? delta < 0 : delta > 0;
+  const color = same ? "var(--muted)" : (better ? "#3fb950" : "#f85149");
+  const sign = delta > 0 ? "+" : "";
+  const pctTxt = a ? ` (${sign}${(delta / a * 100).toFixed(0)}%)` : "";
+  return `<tr><td>${name}</td><td>${a.toFixed(digits)}${unit}</td><td>${b.toFixed(digits)}${unit}</td>
+    <td style="color:${color}">${same ? "—" : sign + delta.toFixed(digits) + unit + pctTxt}</td></tr>`;
+}
+function renderCompare() {
+  if (runLog.length < 2) return;
+  const A = runLog.find(x => x.n === +$("cmpA").value);
+  const B = runLog.find(x => x.n === +$("cmpB").value);
+  if (!A || !B) return;
+  const sa = A.r.stats, sb = B.r.stats;
+  $("cmpTable").innerHTML =
+    `<table class="stat-table"><thead><tr>
+       <th>metric</th><th>A · #${A.n}</th><th>B · #${B.n}</th><th>Δ (B vs A)</th>
+     </tr></thead><tbody>
+       ${cmpRow("TTFT", sa.ttft, sb.ttft, true, " ms", 0)}
+       ${cmpRow("TPOT", sa.tpot, sb.tpot, true, " ms", 1)}
+       ${cmpRow("p99 latency", sa.p99, sb.p99, true, " ms", 1)}
+       ${cmpRow("Throughput", sa.toks, sb.toks, false, " tok/s", 1)}
+       ${cmpRow("Total time", sa.total / 1000, sb.total / 1000, true, " s", 2)}
+       ${cmpRow("Tokens out", A.r.generated, B.r.generated, false, "", 0)}
+     </tbody></table>`;
+  $("cmpOutputs").innerHTML =
+    `<div class="cmp-col"><div class="cmp-head" style="color:#58a6ff">A · #${A.n} — ${A.configLabel}</div>
+       <div class="cmp-text">${escapeHtml(A.r.text || "(no output)")}</div></div>
+     <div class="cmp-col"><div class="cmp-head" style="color:#3fb950">B · #${B.n} — ${B.configLabel}</div>
+       <div class="cmp-text">${escapeHtml(B.r.text || "(no output)")}</div></div>`;
+}
+$("cmpA").addEventListener("change", renderCompare);
+$("cmpB").addEventListener("change", renderCompare);
 
 // ---------- control panel ----------
 function readCfg(useCacheOverride) {
   return {
     prompt: $("prompt").value,
+    system: $("system").value.trim(),
     maxTokens: parseInt($("maxTokens").value),
     useCache: useCacheOverride !== undefined ? useCacheOverride : $("cacheEngine").value === "kv",
     precision: $("precision").value,
     model: $("modelSelect").value,
-    pinned: $("memLoad").value === "pinned",
   };
 }
 function setBusy(b, msg) {
-  ["runBtn", "abBtn", "clearBtn"].forEach(id => $(id).disabled = b);
+  ["runBtn", "abBtn", "optBtn", "clearBtn"].forEach(id => $(id).disabled = b);
   $("stopBtn").disabled = !b;   // Stop is only active while a run is in flight
   $("runStatus").textContent = msg || "";
 }
@@ -293,19 +346,11 @@ const PREC_HINT = {
 $("maxTokens").addEventListener("input", e => $("maxTokensVal").textContent = e.target.value);
 $("precision").addEventListener("change", e => {
   $("precHint").textContent = PREC_HINT[e.target.value] || "";
-  $("batchBars").innerHTML = ""; $("batchNote").textContent = ""; batchData = null;
 });
 $("precHint").textContent = PREC_HINT.fp16;
 $("modelSelect").addEventListener("change", () => {
   $("deviceSub").textContent = `${currentModelLabel()} · loads on next run`;
-  $("vramBars").innerHTML = "";
-  $("batchBars").innerHTML = ""; $("batchHero").textContent = "–"; $("batchNote").textContent = "";
-  $("quantHero").textContent = "–"; $("quantHeroErr").textContent = "–";
-  $("quantBars").innerHTML = ""; $("quantNote").textContent = "press Measure to update this model";
-  batchData = null;
-  pagedCompute(`showing ${currentModelLabel()} KV dimensions`);
 });
-$("blockSize").addEventListener("change", () => pagedCompute(`block size = ${$("blockSize").value} tokens`));
 
 // send a chat turn — appends your message, generates with full conversation context
 $("runBtn").addEventListener("click", async () => {
@@ -336,7 +381,6 @@ $("runBtn").addEventListener("click", async () => {
     setStatTable(chartSeries);
     logHistory(label, cfg, r);
     if (r.aborted) logLine(`⏹ stopped by user after ${r.generated} tokens`, "err");
-    if (!r.aborted) autoUpdatePaged(r);
     refreshModelInfo();
   } catch (e) {
     chatMessages.push({ role: "assistant", content: `[error: ${e.message}]` });
@@ -384,7 +428,6 @@ $("abBtn").addEventListener("click", async () => {
       runs.push({ ...ser, r });
       setStatTable(chartSeries);
       logHistory(label, cfg, r);
-      if (useCache) autoUpdatePaged(r);
     }
     refreshModelInfo();
     const on = runs[0].stats, off = runs[1].stats;
@@ -404,148 +447,77 @@ $("abBtn").addEventListener("click", async () => {
   setBusy(false);
 });
 
+// A/B: stack the optimizations — baseline (FP16 + no cache) vs optimized (4-bit + KV cache)
+$("optBtn").addEventListener("click", async () => {
+  const base = readCfg();
+  if (!base.prompt.trim()) base.prompt = "Explain how a CPU works, in detail.";
+  userStopped = false;
+  $("output").innerHTML = ""; chartSeries = [];
+  const configs = [
+    { label: "baseline · no cache", color: "#f85149", precision: "fp16", useCache: false },
+    { label: "optimized · KV cache", color: "#3fb950", precision: "nf4", useCache: true },
+  ];
+  const runs = [];
+  try {
+    setBusy(true, "warming up…");
+    logLine("optimized-vs-baseline warmup…", "in");
+    await runGeneration({ ...base, precision: "fp16", useCache: true, maxTokens: 8 });
+    for (const c of configs) {
+      const cfg = { ...base, precision: c.precision, useCache: c.useCache };
+      setBusy(true, `running ${c.label} (loads ${c.precision})…`);
+      const ser = { decode: [], color: c.color, label: c.label };
+      chartSeries.push(ser);
+      const r = await runGeneration(cfg, (text, ttft, decode) => {
+        $("output").innerHTML = `<b style="color:${c.color}">${c.label}:</b>\n` + escapeHtml(text) + '<span class="cursor">▋</span>';
+        $("output").scrollTop = $("output").scrollHeight;
+        ser.decode = decode; drawChart();
+        updateTelemetry(ttft, decode, null, null);
+      });
+      ser.decode = r.decode; ser.stats = r.stats; drawChart();
+      updateTelemetry(r.ttft, r.decode, r.promptTokens, r.generated);
+      runs.push({ ...ser, r });
+      setStatTable(chartSeries);
+      logHistory(c.label, cfg, r);
+    }
+    const info = await fetch("/api/model_info").then(r => r.json()).catch(() => null);
+    if (info) applyModelInfo(info);
+    const b = runs[0].stats, o = runs[1].stats;
+    const tpotX = b.tpot / o.tpot, totalX = b.total / o.total;   // >1 = optimized faster
+    const col = x => x >= 1.0 ? "#3fb950" : "#f0883e";
+    const ratio = `<b style="color:${col(tpotX)}">${tpotX.toFixed(2)}× per-token</b>, ` +
+                  `<b style="color:${col(totalX)}">${totalX.toFixed(2)}× overall</b>`;
+    const vramTxt = (info && info.fp16_mb && info.nf4_mb)
+      ? `<b style="color:#3fb950">${(info.fp16_mb / info.nf4_mb).toFixed(1)}× less VRAM</b> (${info.fp16_mb.toFixed(0)} → ${info.nf4_mb.toFixed(0)} MB)`
+      : "less VRAM";
+    const speedStory = totalX >= 1.0
+      ? `Net speed-up comes from the <b>KV cache</b> (O(N)→ vs O(N²) recompute).`
+      : `It's actually <b>slower</b> here — at short outputs the KV cache barely helps, and 4-bit (bitsandbytes) ` +
+        `adds <b>dequant overhead</b> on a model this small. That's the honest trade: <b>4-bit buys memory, not speed</b>, ` +
+        `on small models. Raise max-tokens to watch the cache win grow.`;
+    $("speedupNote").innerHTML =
+      `Stacking 4-bit + KV cache vs FP16 + no cache: ${ratio}, and ${vramTxt}. ${speedStory} ` +
+      `The other two optimizations — <b>PagedAttention</b> and <b>fused/zero-copy kernels</b> — live in the engine ` +
+      `layer (vLLM / llama.cpp), not HuggingFace.`;
+    $("output").innerHTML = `<b style="color:#f85149">baseline:</b>\n${escapeHtml(runs[0].r.text)}\n\n` +
+      `<b style="color:#3fb950">optimized:</b>\n${escapeHtml(runs[1].r.text)}`;
+  } catch (e) {
+    $("output").innerHTML = `<span style="color:#f85149">Error: ${escapeHtml(e.message)}</span>`;
+    logLine("ERROR: " + e.message, "err");
+  }
+  setBusy(false);
+});
+
 $("clearBtn").addEventListener("click", () => {
   chatMessages = [];
   renderTranscript(null);
   chartSeries = []; drawChart(); setStatTable([]); $("speedupNote").innerHTML = "";
   ["tmTTFT", "tmTPOT", "tmTPS", "tmTokens"].forEach(id => $(id).innerHTML = "–");
+  runLog = []; historyCount = 0;
+  $("historyBody").innerHTML = `<tr class="empty"><td colspan="8">runs you make will be logged here</td></tr>`;
+  $("cmpTable").innerHTML = ""; $("cmpOutputs").innerHTML = "";
+  $("cmpA").innerHTML = ""; $("cmpB").innerHTML = ""; $("cmpEmpty").style.display = "";
   logLine("conversation cleared — starting over", "in");
 });
 $("consoleClear").addEventListener("click", () => { $("consoleLog").innerHTML = ""; });
 drawChart();
 renderTranscript(null);  // show empty-state hint in the transcript box
-
-// ---------- CONTINUOUS BATCHING ----------
-function renderCapacity(d) {
-  const cap = d.capacity, max = cap.paged_fit;
-  bars($("capBars"), [
-    { label: "naive reserve", value: cap.naive_fit, max, color: "#d62728", text: cap.naive_fit + " reqs" },
-    { label: "paged", value: cap.paged_fit, max, color: "#2ca02c", text: cap.paged_fit + " reqs" },
-  ]);
-  $("capNote").innerHTML =
-    `In a <b>${cap.budget_gb} GB</b> KV budget (avg ${cap.avg_len}, max ${cap.max_len}): ` +
-    `naive fits ~<b>${cap.naive_fit}</b>, paging fits ~<b style="color:#2ca02c">${cap.paged_fit}</b> ` +
-    `— <b style="color:#2ca02c">${cap.ratio.toFixed(1)}× more concurrent users</b> on the same GPU.`;
-}
-let batchData = null;
-function fetchBatching(runBenchmark) {
-  const avg = $("capAvg").value, max = $("capMax").value, budget = $("capBudget").value;
-  const model = $("modelSelect").value, precision = $("precision").value;
-  if (runBenchmark) { $("batchNote").textContent = "running batched-decode benchmark (loads once, ~10s)…"; $("batchBtn").disabled = true; }
-  fetch(`/api/batching?avg_len=${avg}&max_len=${max}&budget_gb=${budget}&model_key=${model}&precision=${precision}`)
-    .then(r => r.json()).then(d => {
-      batchData = d; $("batchBtn").disabled = false;
-      $("batchHero").textContent = d.batch_speedup.toFixed(1) + "×";
-      const tps = d.throughput, maxTps = Math.max(...tps.map(t => t.tokens_per_sec));
-      bars($("batchBars"), tps.map(t => ({
-        label: `batch ${t.batch}`, value: t.tokens_per_sec, max: maxTps,
-        color: "#58a6ff", text: `${t.tokens_per_sec.toFixed(0)} tok/s · ${t.ms_per_step.toFixed(0)} ms/step`,
-      })));
-      const flat = tps[tps.length - 1].ms_per_step / tps[0].ms_per_step;
-      $("batchNote").innerHTML =
-        `Batch 16 produces <b style="color:#58a6ff">${d.batch_speedup.toFixed(1)}× more tokens/sec</b> than batch 1, ` +
-        `yet each step takes about the <b>same time</b> (${flat.toFixed(2)}× latency). ` +
-        `The step is dominated by reading weights once — extra sequences ride along nearly free.`;
-      renderCapacity(d); refreshModelInfo();
-    })
-    .catch(e => { $("batchBtn").disabled = false; $("batchNote").textContent = "Error: " + e; });
-}
-$("batchBtn").addEventListener("click", () => fetchBatching(true));
-const debouncedCap = debounce(() => { if (batchData) fetchBatching(false); }, 500);
-["capAvg", "capMax", "capBudget"].forEach(id => $(id).addEventListener("input", debouncedCap));
-
-// ---------- PHYSICAL MEMORY PAGE GRID (simulation) ----------
-function autoUpdatePaged(r) {
-  const total = r.promptTokens + r.generated;
-  $("lengths").value = $("lengths").value + "," + total;
-  pagedCompute(`auto-added your last run (${total} tokens)`);
-}
-function pagedCompute(statusMsg) {
-  const lengths = $("lengths").value, maxLen = $("maxLen").value;
-  const model = $("modelSelect").value, blockSize = $("blockSize").value;
-  fetch(`/api/paged?lengths=${encodeURIComponent(lengths)}&max_len=${maxLen}&model_key=${model}&block_size=${blockSize}`)
-    .then(r => r.json()).then(d => {
-      $("pagedHero").textContent = d.reduction.toFixed(1) + "×";
-      const max = d.naive_mb;
-      bars($("pagedBars"), [
-        { label: "naive reserve", value: d.naive_mb, max, color: "#d62728", text: d.naive_mb.toFixed(0) + " MB" },
-        { label: "paged", value: d.paged_mb, max, color: "#2ca02c", text: d.paged_mb.toFixed(1) + " MB" },
-        { label: "actually needed", value: d.useful_mb, max, color: "#58a6ff", text: d.useful_mb.toFixed(1) + " MB" },
-      ]);
-      const naiveBlocks = d.naive_blocks_per_seq;
-      $("blockGrid").innerHTML = d.lengths.map((L, i) => {
-        const used = d.blocks_per_seq[i];
-        const wasted = naiveBlocks - used;
-        let html = `<div class="seq-row"><div class="seq-name">req ${i} (${L} tok)</div><div class="blocks">`;
-        html += `<div class="blk used"></div>`.repeat(used);
-        html += `<div class="blk wasted"></div>`.repeat(Math.min(wasted, 40));
-        if (wasted > 40) html += `<span class="wasted" style="font-size:10px"> +${wasted - 40} more</span>`;
-        return html + "</div></div>";
-      }).join("");
-      $("pagedNote").innerHTML =
-        (statusMsg ? `<i>${statusMsg}</i><br>` : "") +
-        `Naive reserves ${d.naive_blocks_per_seq} blocks/request regardless of length — grey cells are wasted. ` +
-        `Block = ${d.block_size} tokens = ${(d.bytes_per_token * d.block_size / 1024).toFixed(0)} KB. ` +
-        `<i>Simulation of vLLM's allocator — real KV byte math, not a live kernel.</i>`;
-    })
-    .catch(e => { $("pagedNote").textContent = "Error: " + e; });
-}
-$("pagedBtn").addEventListener("click", () => pagedCompute());
-const debouncedPaged = debounce(() => pagedCompute(), 600);
-$("lengths").addEventListener("input", debouncedPaged);
-$("maxLen").addEventListener("input", debouncedPaged);
-pagedCompute();
-
-// ---------- QUANTIZATION (measured; AWQ/GPTQ/GGUF modeled) ----------
-function quantFetch() {
-  const gs = $("groupSize").value;
-  $("quantNote").textContent = "measuring on a real weight…";
-  fetch(`/api/quant?group_size=${gs}&model_key=${$("modelSelect").value}`).then(r => r.json()).then(d => {
-    $("quantHero").textContent = (d.fp16_kb / d.int4_kb).toFixed(1) + "×";
-    $("quantHeroErr").textContent = d.int4_rel_err.toFixed(1) + "%";
-    const max = d.fp16_kb;
-    bars($("quantBars"), [
-      { label: "FP16 baseline", value: d.fp16_kb, max, color: "#1f77b4", text: d.fp16_kb.toFixed(0) + " KB" },
-      { label: `INT8 (${d.int8_rel_err.toFixed(1)}% err)`, value: d.int8_kb, max, color: "#ff7f0e", text: d.int8_kb.toFixed(0) + " KB" },
-      { label: `INT4 AWQ/GPTQ-style g=${gs} (${d.int4_rel_err.toFixed(1)}%)`, value: d.int4_kb, max, color: "#2ca02c", text: d.int4_kb.toFixed(0) + " KB" },
-      { label: `INT2 GGUF-style (${d.int2_rel_err.toFixed(1)}%)`, value: d.int2_kb, max, color: "#9467bd", text: d.int2_kb.toFixed(0) + " KB" },
-    ]);
-    $("quantNote").innerHTML =
-      `Weight: <code>${d.weight}</code> ${d.shape.join("×")}. ` +
-      `INT4 group=${gs}: <b style="color:#2ca02c">${(d.fp16_kb / d.int4_kb).toFixed(1)}× smaller</b> at ${d.int4_rel_err.toFixed(1)}% error. ` +
-      `INT2 is <b>${(d.fp16_kb / d.int2_kb).toFixed(1)}× smaller</b> but error jumps to ${d.int2_rel_err.toFixed(1)}% — why 2-bit needs clever schemes. ` +
-      `<i>INT8 & 4-bit run live above; INT2/AWQ/GPTQ/GGUF are measured size+error here.</i>`;
-    refreshModelInfo();
-  }).catch(e => { $("quantNote").textContent = "Error: " + e; });
-}
-$("quantBtn").addEventListener("click", quantFetch);
-$("groupSize").addEventListener("change", quantFetch);
-quantFetch();
-
-function renderVram(d) {
-  if (!d.fp16_mb && !d.nf4_mb && !d.int8_mb) return;
-  const max = Math.max(d.fp16_mb || 0, d.int8_mb || 0, d.nf4_mb || 0);
-  const rows = [];
-  if (d.fp16_mb) rows.push({ label: "model FP16", value: d.fp16_mb, max, color: "#1f77b4", text: d.fp16_mb.toFixed(0) + " MB" });
-  if (d.int8_mb) rows.push({ label: "model INT8", value: d.int8_mb, max, color: "#ff7f0e", text: d.int8_mb.toFixed(0) + " MB" });
-  if (d.nf4_mb) rows.push({ label: "model 4-bit", value: d.nf4_mb, max, color: "#2ca02c", text: d.nf4_mb.toFixed(0) + " MB" });
-  bars($("vramBars"), rows);
-}
-
-// ---------- ZERO-COPY ----------
-$("zcBtn").addEventListener("click", () => {
-  $("zcNote").textContent = "running 20-iteration transfer benchmark…";
-  $("zcBars").innerHTML = "";
-  fetch("/api/zerocopy").then(r => r.json()).then(d => {
-    if (d.error) { $("zcNote").textContent = d.error; return; }
-    $("zcHero").textContent = d.speedup.toFixed(1) + "×";
-    const max = Math.max(d.pinned_gbps, d.pageable_gbps);
-    bars($("zcBars"), [
-      { label: "pageable", value: d.pageable_gbps, max, color: "#d62728", text: d.pageable_gbps.toFixed(1) + " GB/s" },
-      { label: "pinned", value: d.pinned_gbps, max, color: "#2ca02c", text: d.pinned_gbps.toFixed(1) + " GB/s" },
-    ]);
-    $("zcNote").innerHTML =
-      `Pinned memory transfers <b style="color:#2ca02c">${d.speedup.toFixed(1)}× faster</b> ` +
-      `(${d.transfer_mb.toFixed(0)} MB, averaged over 20 runs). ±5% variance is normal (PCIe thermal).`;
-  });
-});
