@@ -27,15 +27,6 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-from quantization import (
-    quantize_int4_group, dequantize_int4_group,
-    quantize_int8_symmetric, dequantize_int8_symmetric,
-    quantize_intn_group, dequantize_intn_group,
-)
-from paged_attention import KVConfig, BLOCK_SIZE
-from zero_copy import cuda_time
-from batching import measure_batched_throughput, concurrency_capacity
-
 DEFAULT_MODEL_KEY = "qwen25_05b"
 MODEL_SPECS = {
     "qwen25_05b": {
@@ -69,7 +60,6 @@ _tokenizers: dict[str, object] = {}
 _models: dict[tuple[str, str], object] = {}
 _footprint_mb: dict[tuple[str, str], float] = {}
 _active_model_key: str | None = None
-_batching_cache: dict[tuple[str, str], list[dict]] = {}
 
 
 def _model_spec(model_key: str) -> dict:
@@ -165,27 +155,77 @@ def vram_total_mb() -> float:
     return 0.0
 
 
-def build_prompt(tokenizer, user_msg: str) -> str:
-    messages = [{"role": "user", "content": user_msg}]
+def build_prompt(tokenizer, user_msg: str, system: str = "") -> str:
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user_msg})
     return tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
 
 
+def _select_token(logits, context_ids, params, generator):
+    """Pick the next token id from raw logits.
+
+    Greedy (argmax) when temperature <= 0. Otherwise applies, in order:
+    repetition penalty over the tokens seen so far, temperature scaling,
+    top-k filtering, and top-p (nucleus) filtering, then samples. Returns an int.
+    """
+    logits = logits.clone()
+    penalty = params.get("repetition_penalty", 1.0) or 1.0
+    if penalty != 1.0 and context_ids:
+        ids = torch.tensor(sorted(set(context_ids)), device=logits.device)
+        s = logits[0, ids]
+        logits[0, ids] = torch.where(s > 0, s / penalty, s * penalty)
+
+    temp = params.get("temperature", 0.0) or 0.0
+    if temp <= 0:
+        return int(torch.argmax(logits, dim=-1))
+
+    logits = logits / temp
+    top_k = params.get("top_k", 0) or 0
+    if top_k > 0:
+        kth = torch.topk(logits, min(top_k, logits.size(-1))).values[:, -1, None]
+        logits = torch.where(logits < kth, torch.full_like(logits, float("-inf")), logits)
+
+    top_p = params.get("top_p", 1.0) or 1.0
+    if 0 < top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        cum = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        remove = cum > top_p
+        remove[..., 1:] = remove[..., :-1].clone()   # keep the first token over the threshold
+        remove[..., 0] = False
+        logits = logits.masked_fill(remove.scatter(-1, sorted_idx, remove), float("-inf"))
+
+    probs = torch.softmax(logits, dim=-1)
+    return int(torch.multinomial(probs, num_samples=1, generator=generator))
+
+
 @torch.no_grad()
 def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
-                    use_cache: bool, pinned: bool = False):
+                    use_cache: bool, pinned: bool = False, params: dict | None = None):
     """Yield (delta_text, dt_ms, index). index 0's dt is the prefill = TTFT.
 
+    `params` carries the real sampling knobs (temperature, top_p, top_k,
+    repetition_penalty, seed). With temperature <= 0 decoding is greedy/deterministic;
+    otherwise tokens are sampled, optionally reproducibly via the seed.
+
     `pinned` toggles a REAL zero-copy transfer path for the per-step token input:
-    a page-locked (pinned) host buffer reused across steps + non_blocking H2D copy,
-    versus an ordinary pageable allocation each step. At single-token decode this
-    moves ~8 bytes/step, so the effect is in the noise — pinned memory matters for
-    large/batched transfers (see the zero-copy benchmark). The path is genuine, though.
+    a page-locked (pinned) host buffer reused across steps + non_blocking H2D copy.
     """
+    params = params or {}
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
     prompt_len = input_ids.shape[1]
     eos = tokenizer.eos_token_id
+
+    # seeded generator only matters when sampling (temperature > 0)
+    generator = None
+    if (params.get("temperature", 0) or 0) > 0:
+        generator = torch.Generator(device=DEVICE)
+        if params.get("seed") is not None:
+            generator.manual_seed(int(params["seed"]))
+    context_ids = input_ids[0].tolist()  # prompt + generated, for repetition penalty
 
     def sync():
         if DEVICE == "cuda":
@@ -212,7 +252,8 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     out = model(input_ids, use_cache=use_cache)
     past = out.past_key_values if use_cache else None
     logits = out.logits[:, -1, :]
-    next_id = int(torch.argmax(logits, dim=-1))
+    next_id = _select_token(logits, context_ids, params, generator)
+    context_ids.append(next_id)
     sync()
     yield _emit(tokenizer, generated, next_id, prev_text, (time.perf_counter() - t0) * 1000, 0)
     prev_text = tokenizer.decode(generated, skip_special_tokens=True)
@@ -230,7 +271,8 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
             seq = torch.cat([seq, step_input(next_id)], dim=1)
             out = model(seq, use_cache=False)
         logits = out.logits[:, -1, :]
-        next_id = int(torch.argmax(logits, dim=-1))
+        next_id = _select_token(logits, context_ids, params, generator)
+        context_ids.append(next_id)
         sync()
         event = _emit(tokenizer, generated, next_id, prev_text, (time.perf_counter() - t0) * 1000, i)
         prev_text = tokenizer.decode(generated, skip_special_tokens=True)
@@ -265,11 +307,21 @@ async def ws_generate(ws: WebSocket):
         use_cache = bool(req.get("use_cache", True))
         precision = req.get("precision", "fp16")
         pinned = bool(req.get("pinned", False))
+        system = (req.get("system") or "").strip()
+        seed = req.get("seed")
+        params = {
+            "temperature": float(req.get("temperature", 0.0) or 0.0),
+            "top_p": float(req.get("top_p", 1.0) or 1.0),
+            "top_k": int(req.get("top_k", 0) or 0),
+            "repetition_penalty": float(req.get("repetition_penalty", 1.0) or 1.0),
+            "seed": int(seed) if seed not in (None, "", "null") else None,
+        }
 
         spec = _model_spec(model_key)
         engine = "KV-cache (O(N))" if use_cache else "naive recompute (O(N²))"
-        mem = "pinned/zero-copy H2D" if pinned else "pageable H2D"
-        await log(f"pipeline start · {spec['short']} · {precision.upper()} · {engine} · {mem} · {max_new} tok")
+        decode = "greedy" if params["temperature"] <= 0 else (
+            f"sample T={params['temperature']:g} top_p={params['top_p']:g} top_k={params['top_k']}")
+        await log(f"pipeline start · {spec['short']} · {precision.upper()} · {engine} · {decode} · {max_new} tok")
         await ws.send_json({"type": "meta", "vram_total_mb": vram_total_mb()})
 
         cached = (model_key, precision) in _models
@@ -278,14 +330,16 @@ async def ws_generate(ws: WebSocket):
         tokenizer = get_tokenizer(model_key)
         # multi-turn chat: if the client sends a full message history, template the
         # whole conversation so the model has context; else wrap a single prompt.
+        # A system prompt (if any) is prepended either way.
         messages = req.get("messages")
         if messages:
+            full = ([{"role": "system", "content": system}] if system else []) + messages
             prompt = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                full, tokenize=False, add_generation_prompt=True
             )
-            await log(f"context · {len(messages)} messages in conversation")
+            await log(f"context · {len(full)} messages in conversation")
         else:
-            prompt = build_prompt(tokenizer, req.get("prompt", "Hello!"))
+            prompt = build_prompt(tokenizer, req.get("prompt", "Hello!"), system)
         model = get_model(model_key, precision)
         footprint = _footprint_mb.get((model_key, precision), 0.0)
         await log(f"model ready · weights {footprint:.0f} MB · VRAM allocated {vram_allocated_mb():.0f} MB")
@@ -301,7 +355,7 @@ async def ws_generate(ws: WebSocket):
 
         def worker():
             try:
-                for event in stream_generate(model, tokenizer, prompt, max_new, use_cache, pinned):
+                for event in stream_generate(model, tokenizer, prompt, max_new, use_cache, pinned, params):
                     loop.call_soon_threadsafe(queue.put_nowait, event)
                     if stop_event.is_set():
                         break
@@ -369,119 +423,6 @@ def model_info():
         "device": torch.cuda.get_device_name(0) if DEVICE == "cuda" else "CPU",
     }
 
-
-@app.get("/api/paged")
-def paged(
-    lengths: str = "40,55,60,80,120,150,200,300,512,900",
-    max_len: int = 2048,
-    model_key: str = DEFAULT_MODEL_KEY,
-    block_size: int = BLOCK_SIZE,
-):
-    spec = _model_spec(model_key)
-    kv = KVConfig(spec["id"], trust_remote_code=spec["trust_remote_code"])
-    actual = [int(x) for x in lengths.split(",") if x.strip()]
-    bytes_per_block = kv.bytes_per_token * block_size
-    naive_blocks_each = (max_len + block_size - 1) // block_size
-    paged_each = [(L + block_size - 1) // block_size for L in actual]
-    naive_mb = len(actual) * naive_blocks_each * bytes_per_block / 1024**2
-    paged_mb = sum(paged_each) * bytes_per_block / 1024**2
-    useful_mb = sum(actual) * kv.bytes_per_token / 1024**2
-    return {
-        "lengths": actual,
-        "block_size": block_size,
-        "bytes_per_token": kv.bytes_per_token,
-        "blocks_per_seq": paged_each,
-        "naive_blocks_per_seq": naive_blocks_each,
-        "naive_mb": naive_mb, "paged_mb": paged_mb, "useful_mb": useful_mb,
-        "reduction": naive_mb / paged_mb if paged_mb else 0,
-    }
-
-
-@app.get("/api/quant")
-def quant(group_size: int = 128, model_key: str = DEFAULT_MODEL_KEY):
-    model = get_model(model_key, "fp16")
-    weights = [(n, p) for n, p in model.named_parameters() if p.ndim == 2]
-    preferred = [
-        (n, p)
-        for n, p in weights
-        if any(part in n for part in ("q_proj.weight", "qkv_proj.weight", "query_key_value.weight"))
-    ]
-    if not weights:
-        raise HTTPException(status_code=500, detail="no 2D model weights found")
-    name, w = (preferred or weights)[0]
-    w = w.detach().float().cpu()
-
-    q8, s8 = quantize_int8_symmetric(w)
-    w8 = dequantize_int8_symmetric(q8, s8)
-    q4, s4, z4 = quantize_int4_group(w, group_size=group_size)
-    w4 = dequantize_int4_group(q4, s4, z4, w.shape)
-    # INT2 modeled with the same affine group scheme (≈ GGUF Q2-style storage/error)
-    q2, s2, z2 = quantize_intn_group(w, nbits=2, group_size=group_size)
-    w2 = dequantize_intn_group(q2, s2, z2, w.shape)
-
-    def rel_err(a, b):
-        return ((a - b).abs().sum() / a.abs().sum()).item() * 100
-
-    return {
-        "weight": name, "shape": list(w.shape), "group_size": group_size,
-        "int8_rel_err": rel_err(w, w8),
-        "int4_rel_err": rel_err(w, w4),
-        "int2_rel_err": rel_err(w, w2),
-        "fp16_kb": w.numel() * 2 / 1024,
-        "int8_kb": (q8.numel() + s8.numel() * 4) / 1024,
-        "int4_kb": (q4.numel() * 0.5 + s4.numel() * 2 + z4.numel() * 2) / 1024,
-        "int2_kb": (q2.numel() * 0.25 + s2.numel() * 2 + z2.numel() * 2) / 1024,
-    }
-
-
-@app.get("/api/batching")
-def batching(
-    avg_len: int = 180,
-    max_len: int = 2048,
-    budget_gb: float = 4.0,
-    model_key: str = DEFAULT_MODEL_KEY,
-    precision: str = "fp16",
-):
-    """Batched-decode throughput (measured once, cached) + concurrency capacity."""
-    cache_key = (model_key, precision)
-    if cache_key not in _batching_cache:
-        tokenizer = get_tokenizer(model_key)
-        model = get_model(model_key, precision)
-        _batching_cache[cache_key] = measure_batched_throughput(model, tokenizer, DEVICE)
-    spec = _model_spec(model_key)
-    kv = KVConfig(spec["id"], trust_remote_code=spec["trust_remote_code"])
-    cap = concurrency_capacity(kv, budget_gb=budget_gb, avg_len=avg_len, max_len=max_len)
-    throughput = _batching_cache[cache_key]
-    base = throughput[0]["tokens_per_sec"]
-    return {
-        "throughput": throughput,
-        "batch1_tps": base,
-        "best_tps": throughput[-1]["tokens_per_sec"],
-        "batch_speedup": throughput[-1]["tokens_per_sec"] / base if base else 0,
-        "capacity": cap,
-    }
-
-
-@app.get("/api/zerocopy")
-def zerocopy():
-    if DEVICE != "cuda":
-        return {"error": "needs a GPU"}
-    n = 64 * 1024 * 1024 // 4  # 64 MB
-    pageable = torch.empty(n, dtype=torch.float32)
-    pinned = torch.empty(n, dtype=torch.float32).pin_memory()
-    # warm up both paths before timing so we measure steady-state, not first-run
-    _ = pageable.to("cuda"); _ = pinned.to("cuda", non_blocking=True)
-    torch.cuda.synchronize()
-    # 20 iters gives a stable median; PCIe bandwidth fluctuates ±5% thermally
-    t_pageable = cuda_time(lambda: pageable.to("cuda", non_blocking=False), iters=20)
-    t_pinned = cuda_time(lambda: pinned.to("cuda", non_blocking=True), iters=20)
-    gb = n * 4 / 1024**3
-    return {
-        "transfer_mb": n * 4 / 1024**2,
-        "pageable_gbps": gb / (t_pageable / 1000),
-        "pinned_gbps": gb / (t_pinned / 1000),
-        "speedup": t_pageable / t_pinned,
-    }
 
 
 # static frontend (mounted last so it doesn't shadow /api routes)
