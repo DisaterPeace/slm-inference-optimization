@@ -31,6 +31,14 @@
       <textarea id="prompt" rows="2" placeholder="Type a message… the conversation continues across turns (Clear &amp; start over to reset)">Explain how a CPU works, in detail.</textarea>
 
       <div class="control-grid">
+        <label>Engine
+          <select id="engine">
+            <option value="hf">HuggingFace · GPU</option>
+            <option value="llamacpp">llama.cpp · CPU / GGUF</option>
+          </select>
+          <span class="ctrl-hint" id="engineHint">PyTorch on the GPU</span>
+        </label>
+
         <label>Model
           <select id="modelSelect">
             <option value="qwen25_05b">Qwen2.5 0.5B</option>
@@ -53,6 +61,14 @@
             <option value="naive">Naive — recompute · O(N²)</option>
           </select>
           <span class="ctrl-hint">reuse vs recompute past tokens</span>
+        </label>
+
+        <label id="mmapWrap" style="display:none">Memory load
+          <select id="mmapMode">
+            <option value="mmap">mmap — zero-copy</option>
+            <option value="copy">full read — copy</option>
+          </select>
+          <span class="ctrl-hint">copy elimination · affects load time</span>
         </label>
 
         <label>Max generation tokens
@@ -86,7 +102,7 @@
     <section class="card wide">
       <div class="card-head">
         <h2>Live telemetry matrix</h2>
-        <span class="tag">measured on the GPU this run</span>
+        <span class="tag">measured live this run</span>
       </div>
       <div class="telemetry">
         <div class="readout"><div class="ro-label">TTFT</div><div id="tmTTFT" class="ro-val">–<span class="ro-unit">ms</span></div><div class="ro-sub">time to first token (prefill)</div></div>
@@ -191,6 +207,40 @@
       <div class="table-wrap"><div id="cmpTable"></div></div>
       <div id="cmpOutputs" class="cmp-outputs"></div>
       <div id="cmpEmpty" class="note">Make at least two runs (change a setting between them) to compare here.</div>
+    </section>
+
+    <!-- ============ QUANTIZATION TRADEOFF ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Quantization tradeoff</h2>
+        <span class="tag">llama.cpp · GGUF ladder · CPU</span>
+        <label class="sweep-pick">model <select id="sweepModel"></select></label>
+        <button id="sweepBtn" class="ghost mini">Run sweep</button>
+      </div>
+      <div class="why">
+        <span class="q">Which quant is the best deal?</span>
+        Lower-bit quants are smaller and cheaper to read, but lose quality. This sweeps the
+        selected llama.cpp model's GGUF ladder (Q8→Q2) and measures <b>file size</b>,
+        <b>perplexity</b> (quality — lower is better), and <b>tok/s</b> on the CPU. The
+        <b>knee</b> of the size↔quality curve is the sweet spot (usually Q4_K_M).
+        <i>Slow — downloads + loads each level (Qwen ≈ 2 GB total; Phi is much larger).</i>
+      </div>
+      <div class="gen-grid">
+        <div>
+          <h3>Size vs perplexity <span class="hint">lower-left = better · ● = best tradeoff</span></h3>
+          <canvas id="tradeChart" width="480" height="260"></canvas>
+        </div>
+        <div>
+          <h3>Measured ladder</h3>
+          <div class="table-wrap">
+            <table class="stat-table">
+              <thead><tr><th>quant</th><th>size</th><th title="Perplexity on a fixed text — lower = closer to full precision">PPL ↓</th><th>tok/s</th></tr></thead>
+              <tbody id="tradeBody"><tr class="empty"><td colspan="4">hit Run sweep (uses the current Engine's model)</td></tr></tbody>
+            </table>
+          </div>
+          <div id="tradeNote" class="note"></div>
+        </div>
+      </div>
     </section>
 
   </main>

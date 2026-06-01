@@ -132,7 +132,9 @@ code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 12p
 .control-grid.sampling { margin-top: 0; padding-top: 12px; border-top: 1px dashed var(--border); }
 .control-grid.sampling input[type=number] { width: 100%; }
 .tag.sim { background: #2d2238; color: #c9a8e6; border: 1px solid #4a3a5c; }
-button.mini { padding: 2px 10px; font-size: 11px; margin-left: auto; }
+button.mini { padding: 2px 10px; font-size: 11px; }
+.sweep-pick { margin-left: auto; font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 5px; }
+.sweep-pick select { font-size: 11px; padding: 2px 6px; }
 button.danger { background: var(--red); color: #fff; border-color: var(--red); }
 
 /* ---- chat transcript bubbles ---- */

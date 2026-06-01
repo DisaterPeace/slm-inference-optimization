@@ -29,6 +29,13 @@ function applyModelInfo(d) {
     if (active.nf4_mb) parts.push(`NF4 ${active.nf4_mb.toFixed(0)} MB`);
     $("deviceSub").textContent = parts.join(" · ");
   }
+  if (d.llama_models) {
+    llamaModels = Object.fromEntries(d.llama_models.map(m => [m.key, m.quants]));
+    if ($("sweepModel") && !$("sweepModel").options.length) {
+      $("sweepModel").innerHTML = d.llama_models.map(m => `<option value="${m.key}">${m.label}</option>`).join("");
+    }
+  }
+  if ($("engine")) applyEngine();
 }
 function refreshModelInfo() {
   return fetch("/api/model_info")
@@ -148,6 +155,8 @@ function runGeneration(cfg, onToken) {
       use_cache: cfg.useCache,
       precision: cfg.precision,
       model: cfg.model,
+      engine: cfg.engine,
+      mmap: cfg.mmap,
     }));
 
     ws.onmessage = (ev) => {
@@ -239,6 +248,11 @@ function setStatTable(runs) {
 let historyCount = 0;
 let runLog = [];  // full record of each run, for the Compare panel
 function configLabel(cfg, label) {
+  if (cfg.engine === "llamacpp") {
+    const qs = llamaModels[cfg.model] || [];
+    const q = (qs.find(x => x.key === cfg.precision) || {}).label || cfg.precision;
+    return `llama.cpp(CPU) · ${modelLabel(cfg.model)} · ${q} · ${label}`;
+  }
   return `${modelLabel(cfg.model)} · ${cfg.precision.toUpperCase()} · ${label}`;
 }
 function logHistory(label, cfg, r) {
@@ -315,10 +329,17 @@ function readCfg(useCacheOverride) {
     useCache: useCacheOverride !== undefined ? useCacheOverride : $("cacheEngine").value === "kv",
     precision: $("precision").value,
     model: $("modelSelect").value,
+    engine: $("engine").value,
+    mmap: $("mmapMode") ? $("mmapMode").value === "mmap" : true,
   };
 }
 function setBusy(b, msg) {
-  ["runBtn", "abBtn", "optBtn", "clearBtn"].forEach(id => $(id).disabled = b);
+  const llama = $("engine").value === "llamacpp";
+  $("runBtn").disabled = b;
+  $("clearBtn").disabled = b;
+  // the A/B buttons are HuggingFace concepts (naive cache; FP16-vs-4bit) — N/A on llama.cpp
+  $("abBtn").disabled = b || llama;
+  $("optBtn").disabled = b || llama;
   $("stopBtn").disabled = !b;   // Stop is only active while a run is in flight
   $("runStatus").textContent = msg || "";
 }
@@ -342,14 +363,49 @@ const PREC_HINT = {
   int8: "real · bitsandbytes LLM.int8()",
   nf4: "real · bitsandbytes 4-bit (NF4 family, like AWQ/GPTQ)",
 };
+const HF_PRECISIONS = [
+  ["fp16", "FP16 — baseline (full)"],
+  ["int8", "INT8 — LLM.int8() (real)"],
+  ["nf4", "4-bit NF4 — weight-only (real)"],
+];
+let llamaModels = {};  // { modelKey: [{key,label}] } filled from /api/model_info
+
+// repopulate the quantization dropdown for the current engine + model
+function refreshQuantOptions() {
+  if ($("engine").value === "llamacpp") {
+    const qs = llamaModels[$("modelSelect").value] || [{ key: "q4_k_m", label: "Q4_K_M · 4-bit" }];
+    $("precision").innerHTML = qs.map(q => `<option value="${q.key}">${q.label}</option>`).join("");
+    if (qs.find(q => q.key === "q4_k_m")) $("precision").value = "q4_k_m";
+    $("precHint").textContent = "GGUF · down to 2-bit (CPU only)";
+  } else {
+    $("precision").innerHTML = HF_PRECISIONS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+    $("precHint").textContent = PREC_HINT[$("precision").value] || "";
+  }
+}
+
+// swap controls when the engine changes (llama.cpp = CPU/GGUF, always KV-cached)
+function applyEngine() {
+  const llama = $("engine").value === "llamacpp";
+  $("engineHint").textContent = llama ? "llama.cpp · runs on the CPU (edge)" : "PyTorch on the GPU";
+  $("cacheEngine").disabled = llama; if (llama) $("cacheEngine").value = "kv";
+  $("mmapWrap").style.display = llama ? "" : "none";
+  // A/B buttons are HuggingFace-only (llama.cpp always KV-caches; quant ladder differs)
+  $("abBtn").disabled = llama;
+  $("optBtn").disabled = llama;
+  const why = llama ? "HuggingFace only — llama.cpp always uses its KV cache" : "";
+  $("abBtn").title = why; $("optBtn").title = why;
+  refreshQuantOptions();
+}
+$("engine").addEventListener("change", applyEngine);
 
 $("maxTokens").addEventListener("input", e => $("maxTokensVal").textContent = e.target.value);
 $("precision").addEventListener("change", e => {
-  $("precHint").textContent = PREC_HINT[e.target.value] || "";
+  if ($("engine").value === "hf") $("precHint").textContent = PREC_HINT[e.target.value] || "";
 });
 $("precHint").textContent = PREC_HINT.fp16;
 $("modelSelect").addEventListener("change", () => {
   $("deviceSub").textContent = `${currentModelLabel()} · loads on next run`;
+  refreshQuantOptions();   // GGUF quant ladder differs per model
 });
 
 // send a chat turn — appends your message, generates with full conversation context
@@ -402,6 +458,7 @@ $("stopBtn").addEventListener("click", () => {
 // A/B: same prompt, cache on then off
 $("abBtn").addEventListener("click", async () => {
   const base = readCfg();
+  base.engine = "hf"; base.precision = "fp16";   // cache on/off is a HuggingFace comparison
   if (!base.prompt.trim()) base.prompt = "Explain how a CPU works, in detail.";  // A/B is a standalone benchmark
   userStopped = false;
   $("output").innerHTML = ""; chartSeries = [];
@@ -450,6 +507,7 @@ $("abBtn").addEventListener("click", async () => {
 // A/B: stack the optimizations — baseline (FP16 + no cache) vs optimized (4-bit + KV cache)
 $("optBtn").addEventListener("click", async () => {
   const base = readCfg();
+  base.engine = "hf";   // FP16 vs 4-bit is a HuggingFace comparison
   if (!base.prompt.trim()) base.prompt = "Explain how a CPU works, in detail.";
   userStopped = false;
   $("output").innerHTML = ""; chartSeries = [];
@@ -519,5 +577,79 @@ $("clearBtn").addEventListener("click", () => {
   logLine("conversation cleared — starting over", "in");
 });
 $("consoleClear").addEventListener("click", () => { $("consoleLog").innerHTML = ""; });
+
+// ---------- QUANTIZATION TRADEOFF (size vs quality vs speed) ----------
+let tradePoints = [];
+function bestTradeoff(points) {
+  // normalize size + ppl to [0,1]; the point closest to the ideal (small, low-ppl) corner wins
+  const xs = points.map(p => p.size_mb), ys = points.map(p => p.ppl);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const d = points.map(p => Math.hypot(
+    (p.size_mb - x0) / ((x1 - x0) || 1), (p.ppl - y0) / ((y1 - y0) || 1)));
+  return d.indexOf(Math.min(...d));
+}
+function drawTradeoff() {
+  const c = $("tradeChart"), ctx = c.getContext("2d");
+  const W = c.width, H = c.height, padL = 48, padB = 34, padT = 14, padR = 16;
+  ctx.clearRect(0, 0, W, H);
+  if (!tradePoints.length) {
+    ctx.fillStyle = "#6e7681"; ctx.font = "13px sans-serif";
+    ctx.fillText("run the sweep to plot size vs quality", padL + 10, H / 2);
+    return;
+  }
+  const xs = tradePoints.map(p => p.size_mb), ys = tradePoints.map(p => p.ppl);
+  const xmin = Math.min(...xs) * 0.9, xmax = Math.max(...xs) * 1.08;
+  const ymin = Math.min(...ys) * 0.97, ymax = Math.max(...ys) * 1.06;
+  const px = v => padL + ((v - xmin) / (xmax - xmin)) * (W - padL - padR);
+  const py = v => (H - padB) - ((v - ymin) / (ymax - ymin)) * (H - padB - padT);
+  // grid + labels
+  ctx.strokeStyle = "#1c2128"; ctx.fillStyle = "#6e7681"; ctx.font = "10px sans-serif"; ctx.lineWidth = 1;
+  for (let g = 0; g <= 4; g++) {
+    const yv = ymin + (ymax - ymin) * g / 4, y = py(yv);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(yv.toFixed(1), 6, y + 3);
+  }
+  ctx.strokeStyle = "#2a3038";
+  ctx.beginPath(); ctx.moveTo(padL, padT); ctx.lineTo(padL, H - padB); ctx.lineTo(W - padR, H - padB); ctx.stroke();
+  ctx.fillText("perplexity (quality, lower=better)", 6, padT - 2);
+  ctx.fillText("size (MB) →", W - 90, H - 6);
+  // connecting line (sorted by size)
+  const sorted = [...tradePoints].sort((a, b) => a.size_mb - b.size_mb);
+  ctx.strokeStyle = "#58a6ff"; ctx.lineWidth = 2;
+  ctx.beginPath(); sorted.forEach((p, i) => i ? ctx.lineTo(px(p.size_mb), py(p.ppl)) : ctx.moveTo(px(p.size_mb), py(p.ppl))); ctx.stroke();
+  const best = bestTradeoff(tradePoints);
+  tradePoints.forEach((p, i) => {
+    const x = px(p.size_mb), y = py(p.ppl), isBest = i === best;
+    ctx.fillStyle = isBest ? "#3fb950" : "#58a6ff";
+    ctx.beginPath(); ctx.arc(x, y, isBest ? 6 : 4, 0, 7); ctx.fill();
+    ctx.fillStyle = "#c9d3de"; ctx.font = "10px sans-serif";
+    ctx.fillText(p.quant.toUpperCase().replace("_", ""), x + 8, y + 3);
+  });
+}
+$("sweepBtn").addEventListener("click", () => {
+  const model = $("sweepModel") ? $("sweepModel").value : "qwen25_05b";
+  $("sweepBtn").disabled = true;
+  $("tradeNote").innerHTML = `running sweep on <b>${modelLabel(model)}</b> (CPU · downloads + loads each quant — may take a few minutes)…`;
+  fetch(`/api/quant_sweep?model_key=${model}`).then(r => r.json()).then(d => {
+    $("sweepBtn").disabled = false;
+    tradePoints = d.points || [];
+    drawTradeoff();
+    $("tradeBody").innerHTML = tradePoints.length
+      ? tradePoints.map(p => `<tr><td>${p.label}</td><td>${p.size_mb} MB</td><td>${p.ppl}</td><td>${p.tps}</td></tr>`).join("")
+      : `<tr class="empty"><td colspan="4">no data</td></tr>`;
+    if (tradePoints.length) {
+      const b = tradePoints[bestTradeoff(tradePoints)];
+      const big = tradePoints.reduce((a, p) => p.size_mb > a.size_mb ? p : a);
+      const bestPpl = Math.min(...tradePoints.map(p => p.ppl));
+      $("tradeNote").innerHTML =
+        `Best size↔quality tradeoff: <b style="color:#3fb950">${b.label}</b> ` +
+        `— ${b.size_mb} MB at perplexity ${b.ppl} (lowest is ${bestPpl}), ${b.tps} tok/s. ` +
+        `That's <b>${(big.size_mb / b.size_mb).toFixed(1)}× smaller</b> than ${big.label}. ` +
+        `Below the knee, perplexity climbs fast for little extra size savings — which is why <b>Q4_K_M</b> is the common default.`;
+    }
+  }).catch(e => { $("sweepBtn").disabled = false; $("tradeNote").textContent = "Error: " + e; });
+});
+drawTradeoff();
+
 drawChart();
 renderTranscript(null);  // show empty-state hint in the transcript box
