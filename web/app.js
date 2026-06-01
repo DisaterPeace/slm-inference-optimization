@@ -655,5 +655,26 @@ $("sweepBtn").addEventListener("click", () => {
 });
 drawTradeoff();
 
+// ---------- STATIC BATCHING THROUGHPUT (HF / GPU) ----------
+$("batchBtn").addEventListener("click", () => {
+  $("batchBtn").disabled = true;
+  $("batchNote").textContent = "running batched decode at batch 1→16 (Qwen 0.5B, FP16, GPU)…";
+  fetch("/api/batching?model_key=qwen25_05b&precision=fp16").then(r => r.json()).then(d => {
+    $("batchBtn").disabled = false;
+    if (d.error) { $("batchNote").textContent = d.error; return; }
+    $("batchHero").textContent = d.speedup + "×";
+    const tps = d.throughput, max = Math.max(...tps.map(t => t.tokens_per_sec));
+    bars($("batchBars"), tps.map(t => ({
+      label: `batch ${t.batch}`, value: t.tokens_per_sec, max, color: "#58a6ff",
+      text: `${t.tokens_per_sec.toFixed(0)} tok/s · ${t.ms_per_step.toFixed(0)} ms/step`,
+    })));
+    $("batchNote").innerHTML =
+      `Batch 16 produces <b style="color:#58a6ff">${d.speedup}× more tokens/sec</b> than batch 1, ` +
+      `while each step takes about the <b>same time</b> (${d.flat}× latency). The step is dominated by ` +
+      `reading the weights once — extra sequences ride along nearly free. That's why servers batch ` +
+      `aggressively; <b>continuous</b> batching just keeps the batch full at all times (scheduler-level).`;
+  }).catch(e => { $("batchBtn").disabled = false; $("batchNote").textContent = "Error: " + e; });
+});
+
 drawChart();
 renderTranscript(null);  // show empty-state hint in the transcript box

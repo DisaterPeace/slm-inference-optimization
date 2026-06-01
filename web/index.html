@@ -250,6 +250,27 @@
       </div>
     </section>
 
+    <!-- ============ STATIC BATCHING THROUGHPUT ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Static batching throughput</h2>
+        <span class="tag">HuggingFace · GPU · tok/s vs batch size</span>
+        <button id="batchBtn" class="ghost mini">Run</button>
+      </div>
+      <div class="why">
+        <span class="q">Why batching?</span>
+        A single decode step barely uses the GPU — almost all its time goes to reading the model's
+        weights out of VRAM. Decode <b>B sequences at once</b> and they <b>share that one weight read</b>,
+        so total tokens/sec climbs with batch size while the time <i>per step</i> stays nearly flat. That
+        shared-read win is the foundation of server throughput. <b>Continuous batching</b> is the next step —
+        a scheduler that swaps finished sequences out mid-flight — and it lives in serving engines
+        (vLLM / TGI / llama-server), not the libraries here. (llama.cpp's Python API is single-stream.)
+      </div>
+      <div class="headline"><span id="batchHero" class="hero">–</span><span class="hero-sub">more tokens/sec at batch 16 vs batch 1 — for nearly the same latency per step</span></div>
+      <div id="batchBars" class="bars"></div>
+      <div id="batchNote" class="note"></div>
+    </section>
+
   </main>
 
   <script src="/app.js"></script>
