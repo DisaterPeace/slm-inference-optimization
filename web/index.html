@@ -163,6 +163,25 @@
       </div>
     </section>
 
+    <!-- ============ TOKEN CONFIDENCE HEATMAP ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Token confidence</h2>
+        <span class="tag">per-token probability · last run · HuggingFace</span>
+      </div>
+      <div class="why">
+        <span class="q">How sure was the model, token by token?</span>
+        Each generated token is shaded by the model's probability for it at that step —
+        <b style="color:#3fb950">green = confident</b>, <b style="color:#f0883e">amber</b> /
+        <b style="color:#f85149">red = uncertain</b>. Hover any token for its exact probability.
+        Confident stretches are usually boilerplate/grammar; the uncertain tokens are where the model is
+        "deciding" — facts, names, branch points — i.e. the spots most likely to be wrong or to change
+        under sampling. <i>(HuggingFace engine — llama.cpp's streaming API doesn't expose per-token probs.)</i>
+      </div>
+      <div id="heatmap" class="heatmap"><span class="hint">run a prompt on the HuggingFace engine to see token confidence</span></div>
+      <div id="heatmapNote" class="note"></div>
+    </section>
+
     <!-- ============ 4. HARDWARE TERMINAL CONSOLE ============ -->
     <section class="card wide">
       <div class="card-head">

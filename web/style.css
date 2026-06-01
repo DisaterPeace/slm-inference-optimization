@@ -143,6 +143,14 @@ button.danger { background: var(--red); color: #fff; border-color: var(--red); }
 .msg.user { background: #1b2330; border: 1px solid #243042; }
 .msg.assistant { background: #0d1117; border: 1px solid var(--border); }
 
+/* ---- token confidence heatmap ---- */
+.heatmap {
+  background: #0d1117; border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; line-height: 2.1; font-size: 14px; white-space: pre-wrap;
+  min-height: 56px; max-height: 320px; overflow-y: auto;
+}
+.heatmap .tok { border-radius: 3px; padding: 2px 1px; color: #eaf1f8; cursor: default; }
+
 /* ---- compare runs ---- */
 .cmp-outputs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
 .cmp-col { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }

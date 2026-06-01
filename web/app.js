@@ -134,13 +134,13 @@ function runGeneration(cfg, onToken) {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws/generate`);
     activeWs = ws;
-    let settled = false, ttft = null, text = "", decode = [];
+    let settled = false, ttft = null, text = "", decode = [], tokens = [];
     const t_open = performance.now();
 
     const finish = (extra) => {
       if (settled) return; settled = true; activeWs = null;
       resolve({
-        ttft, decode, text,
+        ttft, decode, text, tokens,
         wall: performance.now() - t_open,
         stats: computeStats(ttft, decode),
         ...extra,
@@ -168,6 +168,7 @@ function runGeneration(cfg, onToken) {
         if (m.vram_total_mb) vramTotalMb = m.vram_total_mb;
       } else if (m.type === "token") {
         text += m.text;
+        tokens.push({ text: m.text, p: m.p != null ? m.p : null });
         if (m.index === 0) ttft = m.dt_ms; else decode.push(m.dt_ms);
         if (onToken) onToken(text, ttft, decode);
       } else if (m.type === "done") {
@@ -344,6 +345,33 @@ function setBusy(b, msg) {
   $("runStatus").textContent = msg || "";
 }
 
+// ---------- token confidence heatmap ----------
+function confColor(p) {
+  // p in [0,1]: red (uncertain) → amber → green (confident)
+  const h = Math.round(Math.max(0, Math.min(1, p)) * 120);  // 0=red, 120=green
+  return `hsl(${h}, 55%, 26%)`;
+}
+function renderHeatmap(tokens) {
+  const el = $("heatmap");
+  const withP = (tokens || []).filter(t => t.p != null);
+  if (!withP.length) {
+    el.innerHTML = `<span class="hint">no per-token probabilities — the llama.cpp engine doesn't expose them; switch to the HuggingFace engine</span>`;
+    $("heatmapNote").textContent = "";
+    return;
+  }
+  el.innerHTML = tokens.map(t => t.p == null
+    ? escapeHtml(t.text)
+    : `<span class="tok" style="background:${confColor(t.p)}" title="p = ${(t.p * 100).toFixed(1)}%">${escapeHtml(t.text)}</span>`
+  ).join("");
+  const ps = withP.map(t => t.p);
+  const avg = ps.reduce((a, b) => a + b, 0) / ps.length;
+  const lows = withP.filter(t => t.p < 0.5).length;
+  $("heatmapNote").innerHTML =
+    `Mean confidence <b>${(avg * 100).toFixed(0)}%</b> over ${ps.length} tokens · ` +
+    `<b style="color:#f85149">${lows}</b> low-confidence (&lt;50%). Hover a token for its exact probability — ` +
+    `the uncertain ones are where the model was genuinely choosing.`;
+}
+
 // ---------- chat transcript (multi-turn conversation) ----------
 let chatMessages = [];  // [{role:"user"|"assistant", content}]
 function renderTranscript(streaming) {
@@ -436,6 +464,7 @@ $("runBtn").addEventListener("click", async () => {
     updateTelemetry(r.ttft, r.decode, r.promptTokens, r.generated);
     setStatTable(chartSeries);
     logHistory(label, cfg, r);
+    renderHeatmap(r.tokens);
     if (r.aborted) logLine(`⏹ stopped by user after ${r.generated} tokens`, "err");
     refreshModelInfo();
   } catch (e) {

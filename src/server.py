@@ -253,9 +253,10 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     past = out.past_key_values if use_cache else None
     logits = out.logits[:, -1, :]
     next_id = _select_token(logits, context_ids, params, generator)
+    prob = float(torch.softmax(logits[0].float(), dim=-1)[next_id])
     context_ids.append(next_id)
     sync()
-    yield _emit(tokenizer, generated, next_id, prev_text, (time.perf_counter() - t0) * 1000, 0)
+    yield _emit(tokenizer, generated, next_id, prev_text, (time.perf_counter() - t0) * 1000, 0, prob)
     prev_text = tokenizer.decode(generated, skip_special_tokens=True)
 
     # --- decode loop ---
@@ -272,9 +273,10 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
             out = model(seq, use_cache=False)
         logits = out.logits[:, -1, :]
         next_id = _select_token(logits, context_ids, params, generator)
+        prob = float(torch.softmax(logits[0].float(), dim=-1)[next_id])
         context_ids.append(next_id)
         sync()
-        event = _emit(tokenizer, generated, next_id, prev_text, (time.perf_counter() - t0) * 1000, i)
+        event = _emit(tokenizer, generated, next_id, prev_text, (time.perf_counter() - t0) * 1000, i, prob)
         prev_text = tokenizer.decode(generated, skip_special_tokens=True)
         yield event
 
@@ -284,10 +286,13 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens: int,
     }
 
 
-def _emit(tokenizer, generated, next_id, prev_text, dt_ms, index):
+def _emit(tokenizer, generated, next_id, prev_text, dt_ms, index, prob=None):
     generated.append(next_id)
     full = tokenizer.decode(generated, skip_special_tokens=True)
-    return {"type": "token", "text": full[len(prev_text):], "dt_ms": dt_ms, "index": index}
+    ev = {"type": "token", "text": full[len(prev_text):], "dt_ms": dt_ms, "index": index}
+    if prob is not None:
+        ev["p"] = prob  # model's probability for the chosen token (confidence)
+    return ev
 
 
 # ---------------------------------------------------------------------------
