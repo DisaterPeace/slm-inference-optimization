@@ -290,6 +290,90 @@ def _emit(tokenizer, generated, next_id, prev_text, dt_ms, index):
     return {"type": "token", "text": full[len(prev_text):], "dt_ms": dt_ms, "index": index}
 
 
+# ---------------------------------------------------------------------------
+# Second engine: llama.cpp (GGUF) — the edge / on-device path. Runs on CPU and
+# stacks GGUF quantization + KV cache + mmap'd (zero-copy) weight loading. Built
+# from source for this CPU's AVX2 (the prebuilt wheel assumed AVX-512 and crashed).
+# ---------------------------------------------------------------------------
+# Each model: repo + an ordered quant ladder (key -> (label, filename glob)).
+# GGUF goes all the way down to 2-bit (Q2_K) — below what bitsandbytes/HF can do.
+LLAMA_MODELS = {
+    "qwen25_05b": {
+        "label": "Qwen2.5 0.5B",
+        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "quants": {
+            "fp16": ("F16 · 16-bit (baseline)", "*fp16.gguf"),
+            "q8_0": ("Q8_0 · 8-bit", "*q8_0.gguf"),
+            "q6_k": ("Q6_K · 6-bit", "*q6_k.gguf"),
+            "q5_k_m": ("Q5_K_M · 5-bit", "*q5_k_m.gguf"),
+            "q4_k_m": ("Q4_K_M · 4-bit", "*q4_k_m.gguf"),
+            "q3_k_m": ("Q3_K_M · 3-bit", "*q3_k_m.gguf"),
+            "q2_k": ("Q2_K · 2-bit", "*q2_k.gguf"),
+        },
+    },
+    "phi4_mini": {
+        "label": "Phi-4 Mini 3.8B",
+        "repo": "unsloth/Phi-4-mini-instruct-GGUF",
+        "quants": {
+            "bf16": ("BF16 · 16-bit (baseline ~7.6 GB)", "*BF16.gguf"),
+            "q8_0": ("Q8_0 · 8-bit", "*Q8_0.gguf"),
+            "q6_k": ("Q6_K · 6-bit", "*Q6_K.gguf"),
+            "q5_k_m": ("Q5_K_M · 5-bit", "*Q5_K_M.gguf"),
+            "q4_k_m": ("Q4_K_M · 4-bit", "*Q4_K_M.gguf"),
+            "q3_k_m": ("Q3_K_M · 3-bit", "*Q3_K_M.gguf"),
+            "q2_k": ("Q2_K · 2-bit", "*Q2_K.gguf"),
+        },
+    },
+}
+_llama_models: dict[tuple, object] = {}
+
+
+def get_llama(model_key: str, quant_key: str, use_mmap: bool = True,
+              logits_all: bool = False, n_ctx: int = 4096):
+    """Load a GGUF model via llama.cpp (cached). use_mmap toggles zero-copy load
+    (mmap the file) vs. reading the whole file into a buffer (a real copy) — the
+    'copy elimination' lever. logits_all=True (with a small n_ctx) is used for the
+    perplexity sweep. Only one GGUF model is kept resident at a time."""
+    m = LLAMA_MODELS.get(model_key) or LLAMA_MODELS["qwen25_05b"]
+    if quant_key not in m["quants"]:
+        quant_key = "q4_k_m" if "q4_k_m" in m["quants"] else next(iter(m["quants"]))
+    cache_key = (model_key, quant_key, use_mmap, logits_all, n_ctx)
+    if cache_key not in _llama_models:
+        from llama_cpp import Llama  # lazy import; CPU build
+        # GGUF models are large; keep just the newest one in RAM
+        for k in list(_llama_models):
+            del _llama_models[k]
+        gc.collect()
+        _, glob = m["quants"][quant_key]
+        _llama_models[cache_key] = Llama.from_pretrained(
+            repo_id=m["repo"], filename=glob, n_ctx=n_ctx, verbose=False,
+            use_mmap=use_mmap, logits_all=logits_all,
+        )
+    return _llama_models[cache_key]
+
+
+def stream_generate_llama(llm, messages, max_new_tokens):
+    """Stream tokens from a llama.cpp GGUF model with per-token timing.
+
+    llama.cpp always uses its own KV cache and mmap'd weights; decoding is greedy
+    here so runs are comparable to the HuggingFace engine. index 0's dt is the
+    prompt-eval time (TTFT); later dt's are inter-token gaps.
+    """
+    t0 = time.perf_counter()
+    n = 0
+    for ch in llm.create_chat_completion(
+        messages=messages, max_tokens=max_new_tokens, temperature=0.0, stream=True
+    ):
+        delta = ch["choices"][0]["delta"].get("content", "")
+        if not delta:
+            continue
+        dt = (time.perf_counter() - t0) * 1000
+        yield {"type": "token", "text": delta, "dt_ms": dt, "index": n}
+        n += 1
+        t0 = time.perf_counter()
+    yield {"type": "done", "prompt_tokens": None, "generated": n, "vram_mb": vram_allocated_mb()}
+
+
 @app.websocket("/ws/generate")
 async def ws_generate(ws: WebSocket):
     await ws.accept()
@@ -317,32 +401,56 @@ async def ws_generate(ws: WebSocket):
             "seed": int(seed) if seed not in (None, "", "null") else None,
         }
 
-        spec = _model_spec(model_key)
-        engine = "KV-cache (O(N))" if use_cache else "naive recompute (O(N²))"
-        decode = "greedy" if params["temperature"] <= 0 else (
-            f"sample T={params['temperature']:g} top_p={params['top_p']:g} top_k={params['top_k']}")
-        await log(f"pipeline start · {spec['short']} · {precision.upper()} · {engine} · {decode} · {max_new} tok")
+        req_engine = req.get("engine", "hf")
         await ws.send_json({"type": "meta", "vram_total_mb": vram_total_mb()})
 
-        cached = (model_key, precision) in _models
-        if not cached:
-            await log(f"loading {spec['id']} [{precision}] → VRAM (first use)…")
-        tokenizer = get_tokenizer(model_key)
-        # multi-turn chat: if the client sends a full message history, template the
-        # whole conversation so the model has context; else wrap a single prompt.
-        # A system prompt (if any) is prepended either way.
-        messages = req.get("messages")
-        if messages:
-            full = ([{"role": "system", "content": system}] if system else []) + messages
-            prompt = tokenizer.apply_chat_template(
-                full, tokenize=False, add_generation_prompt=True
-            )
-            await log(f"context · {len(full)} messages in conversation")
+        if req_engine == "llamacpp":
+            # --- llama.cpp (GGUF, CPU) — the edge / on-device engine -----------
+            lm = LLAMA_MODELS.get(model_key) or LLAMA_MODELS["qwen25_05b"]
+            qkey = precision if precision in lm["quants"] else (
+                "q4_k_m" if "q4_k_m" in lm["quants"] else next(iter(lm["quants"])))
+            qlabel = lm["quants"][qkey][0]
+            use_mmap = bool(req.get("mmap", True))
+            mmap_txt = "mmap (zero-copy)" if use_mmap else "full read (copy)"
+            await log(f"pipeline start · llama.cpp (CPU) · {lm['label']} · {qlabel} · {mmap_txt} · greedy · {max_new} tok")
+            msgs = req.get("messages") or [{"role": "user", "content": req.get("prompt", "Hello!")}]
+            full_msgs = ([{"role": "system", "content": system}] if system else []) + msgs
+            if (model_key, qkey, use_mmap, False, 4096) not in _llama_models:
+                await log(f"loading {lm['repo']} [{qkey}] via {mmap_txt} (first use; may download)…")
+            t_load = time.perf_counter()
+            llm = await asyncio.to_thread(get_llama, model_key, qkey, use_mmap)
+            load_ms = (time.perf_counter() - t_load) * 1000
+            try:
+                sz = os.path.getsize(llm.model_path) / 1024 ** 2
+            except Exception:
+                sz = 0.0
+            await log(f"model ready · {mmap_txt} · loaded in {load_ms:.0f} ms · GGUF {sz:.0f} MB · CPU "
+                      f"(GGUF quant + KV cache; mmap = copy elimination)")
+
+            def make_gen():
+                return stream_generate_llama(llm, full_msgs, max_new)
         else:
-            prompt = build_prompt(tokenizer, req.get("prompt", "Hello!"), system)
-        model = get_model(model_key, precision)
-        footprint = _footprint_mb.get((model_key, precision), 0.0)
-        await log(f"model ready · weights {footprint:.0f} MB · VRAM allocated {vram_allocated_mb():.0f} MB")
+            # --- HuggingFace / transformers (GPU) ------------------------------
+            spec = _model_spec(model_key)
+            cache_eng = "KV-cache (O(N))" if use_cache else "naive recompute (O(N²))"
+            await log(f"pipeline start · {spec['short']} · {precision.upper()} · {cache_eng} · greedy · {max_new} tok")
+            if (model_key, precision) not in _models:
+                await log(f"loading {spec['id']} [{precision}] → VRAM (first use)…")
+            tokenizer = get_tokenizer(model_key)
+            # multi-turn chat: full message history (with optional system prompt)
+            messages = req.get("messages")
+            if messages:
+                full = ([{"role": "system", "content": system}] if system else []) + messages
+                prompt = tokenizer.apply_chat_template(full, tokenize=False, add_generation_prompt=True)
+                await log(f"context · {len(full)} messages in conversation")
+            else:
+                prompt = build_prompt(tokenizer, req.get("prompt", "Hello!"), system)
+            model = get_model(model_key, precision)
+            footprint = _footprint_mb.get((model_key, precision), 0.0)
+            await log(f"model ready · weights {footprint:.0f} MB · VRAM allocated {vram_allocated_mb():.0f} MB")
+
+            def make_gen():
+                return stream_generate(model, tokenizer, prompt, max_new, use_cache, pinned, params)
 
         # --- run the blocking generation in a worker THREAD ---------------------
         # Generation is GPU/CPU-bound; running it directly in the async handler
@@ -355,7 +463,7 @@ async def ws_generate(ws: WebSocket):
 
         def worker():
             try:
-                for event in stream_generate(model, tokenizer, prompt, max_new, use_cache, pinned, params):
+                for event in make_gen():
                     loop.call_soon_threadsafe(queue.put_nowait, event)
                     if stop_event.is_set():
                         break
@@ -421,8 +529,68 @@ def model_info():
         "int8_mb": footprint(active, "int8"),
         "nf4_mb": footprint(active, "nf4"),
         "device": torch.cuda.get_device_name(0) if DEVICE == "cuda" else "CPU",
+        "llama_models": [
+            {"key": mk, "label": m["label"],
+             "quants": [{"key": qk, "label": lbl} for qk, (lbl, _) in m["quants"].items()]}
+            for mk, m in LLAMA_MODELS.items()
+        ],
     }
 
+
+_QUANT_SWEEP_REF = (
+    "The Earth orbits the Sun once each year, while the Moon orbits the Earth about once a "
+    "month. Light from the Sun takes roughly eight minutes to reach us. A central processing "
+    "unit executes instructions one step at a time, reading data and weights from memory."
+)
+
+
+def _perplexity(llm, text: str) -> float:
+    """Perplexity of `text` under the model: exp(mean negative log-likelihood per token).
+    Lower = the model finds the text more predictable = closer to full-precision behaviour."""
+    import numpy as np
+    toks = llm.tokenize(text.encode("utf-8"))
+    llm.reset()
+    llm.eval(toks)
+    scores = llm.scores  # (n_ctx, vocab); row i predicts token i+1
+    lps = []
+    for i in range(len(toks) - 1):
+        lg = np.asarray(scores[i], dtype=np.float64)
+        mx = lg.max()
+        lse = mx + np.log(np.exp(lg - mx).sum())
+        lps.append(lg[toks[i + 1]] - lse)
+    return float(np.exp(-sum(lps) / len(lps))) if lps else 0.0
+
+
+@app.get("/api/quant_sweep")
+def quant_sweep(model_key: str = "qwen25_05b", include_fp: bool = False):
+    """Sweep a GGUF model's quant ladder, measuring the size/quality/speed tradeoff.
+
+    For each quant: file size (MB), perplexity on a fixed reference text (quality — lower
+    is better, computed directly from the logits), and decode throughput (tok/s). Runs on
+    CPU via llama.cpp; skips the 16-bit baselines by default. SLOW: downloads + loads each
+    level (FastAPI runs this sync endpoint in a threadpool, so it won't block the loop).
+    """
+    m = LLAMA_MODELS.get(model_key) or LLAMA_MODELS["qwen25_05b"]
+    points = []
+    for qkey, (label, _glob) in m["quants"].items():
+        if not include_fp and qkey in ("fp16", "bf16"):
+            continue
+        llm = get_llama(model_key, qkey, True, logits_all=True, n_ctx=512)
+        try:
+            size_mb = os.path.getsize(llm.model_path) / 1024 ** 2
+        except Exception:
+            size_mb = 0.0
+        ppl = _perplexity(llm, _QUANT_SWEEP_REF)
+        t = time.perf_counter()
+        gen = llm.create_completion("Explain inference in one sentence.", max_tokens=24, temperature=0.0)
+        dt = time.perf_counter() - t
+        ntok = gen.get("usage", {}).get("completion_tokens") or 24
+        points.append({
+            "quant": qkey, "label": label,
+            "size_mb": round(size_mb, 1), "ppl": round(ppl, 2),
+            "tps": round(ntok / dt, 1) if dt else 0.0,
+        })
+    return {"model": model_key, "model_label": m["label"], "points": points}
 
 
 # static frontend (mounted last so it doesn't shadow /api routes)
