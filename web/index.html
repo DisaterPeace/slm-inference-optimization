@@ -31,6 +31,14 @@
       <textarea id="prompt" rows="2" placeholder="Type a message… the conversation continues across turns (Clear &amp; start over to reset)">Explain how a CPU works, in detail.</textarea>
 
       <div class="control-grid">
+        <label>Mode
+          <select id="chatMode">
+            <option value="chat">Chat — remembers context</option>
+            <option value="single">Single message — resets each send</option>
+          </select>
+          <span class="ctrl-hint" id="modeHint">multi-turn conversation</span>
+        </label>
+
         <label>Engine
           <select id="engine">
             <option value="hf">HuggingFace · GPU</option>

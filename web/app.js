@@ -478,37 +478,59 @@ $("modelSelect").addEventListener("change", () => {
   refreshQuantOptions();   // GGUF quant ladder differs per model
   renderTokens();          // re-tokenize (different models tokenize differently)
 });
+$("chatMode").addEventListener("change", () => {
+  const single = $("chatMode").value === "single";
+  $("modeHint").textContent = single ? "standalone · auto-compares to last run" : "multi-turn conversation";
+  // switching modes starts a clean slate (but keeps run history)
+  chatMessages = []; lastSeries = null;
+  renderTranscript(null); chartSeries = []; drawChart(); setStatTable([]);
+  logLine(single ? "single-message mode — each send is standalone, chart keeps last run"
+                 : "chat mode — context accumulates across turns", "in");
+});
 
-// send a chat turn — appends your message, generates with full conversation context
+// send — behaviour depends on Mode:
+//   chat   : multi-turn, context accumulates (the chart shows only this run)
+//   single : each send is standalone (no prior context); the chart keeps the
+//            PREVIOUS run overlaid so every send is an automatic A/B
+let lastSeries = null;  // previous run's curve, kept for single-message comparison
+function shortTag(cfg) {
+  return `${cfg.precision.toUpperCase()} ${cfg.useCache ? "KV" : "naive"}`;
+}
 $("runBtn").addEventListener("click", async () => {
   const msg = $("prompt").value.trim();
   if (!msg) { $("runStatus").textContent = "type a message first"; return; }
   const cfg = readCfg();
+  const single = $("chatMode").value === "single";
   const label = cfg.useCache ? "KV on" : "naive";
   const color = cfg.useCache ? "#3fb950" : "#f85149";
 
-  chatMessages.push({ role: "user", content: msg });
+  if (single) chatMessages = [{ role: "user", content: msg }];   // reset — no history
+  else chatMessages.push({ role: "user", content: msg });        // accumulate
   $("prompt").value = "";
-  renderTranscript("");                 // user bubble + empty streaming reply
+  renderTranscript("");
   userStopped = false;
   setBusy(true, `generating (${label})…`);
-  logLine(`▶ turn ${Math.ceil(chatMessages.length / 2)} · ${modelLabel(cfg.model)} · ${cfg.precision.toUpperCase()} · ${label} · ${cfg.maxTokens} tok`, "in");
-  chartSeries = [{ decode: [], color, label }];
+  const turn = single ? "single" : `turn ${Math.ceil(chatMessages.length / 2)}`;
+  logLine(`▶ ${turn} · ${modelLabel(cfg.model)} · ${cfg.precision.toUpperCase()} · ${label} · ${cfg.maxTokens} tok`, "in");
+
+  const cur = { decode: [], color, label: `current · ${shortTag(cfg)}`, stats: null };
+  chartSeries = (single && lastSeries) ? [lastSeries, cur] : [cur];
   try {
     const r = await runGeneration({ ...cfg, messages: chatMessages }, (text, ttft, decode) => {
       renderTranscript(text);
-      chartSeries[0].decode = decode; drawChart();
+      cur.decode = decode; drawChart();
       updateTelemetry(ttft, decode, null, null);
     });
-    // store the reply (even a partial one from Stop) so the chat can continue
     chatMessages.push({ role: "assistant", content: r.text || "(stopped before any output)" });
     renderTranscript(null);
-    chartSeries[0].decode = r.decode; chartSeries[0].stats = r.stats; drawChart();
+    cur.decode = r.decode; cur.stats = r.stats; drawChart();
     updateTelemetry(r.ttft, r.decode, r.promptTokens, r.generated);
     setStatTable(chartSeries);
     logHistory(label, cfg, r);
     renderHeatmap(r.tokens);
     renderMemTiming(r);
+    // in single mode, this run becomes the "previous" baseline for the next send
+    if (single && !r.aborted) lastSeries = { decode: r.decode, color: "#58a6ff", label: `previous · ${shortTag(cfg)}`, stats: r.stats };
     if (r.aborted) logLine(`⏹ stopped by user after ${r.generated} tokens`, "err");
     refreshModelInfo();
   } catch (e) {
@@ -639,7 +661,7 @@ $("optBtn").addEventListener("click", async () => {
 });
 
 $("clearBtn").addEventListener("click", () => {
-  chatMessages = [];
+  chatMessages = []; lastSeries = null;
   renderTranscript(null);
   chartSeries = []; drawChart(); setStatTable([]); $("speedupNote").innerHTML = "";
   ["tmTTFT", "tmTPOT", "tmTPS", "tmTokens"].forEach(id => $(id).innerHTML = "–");
