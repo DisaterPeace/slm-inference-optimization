@@ -750,6 +750,30 @@ $("sweepBtn").addEventListener("click", () => {
 });
 drawTradeoff();
 
+// ---------- SPECULATIVE DECODING ----------
+$("specBtn").addEventListener("click", () => {
+  const prompt = $("prompt").value.trim() || "Explain how a CPU executes one instruction, step by step.";
+  $("specBtn").disabled = true;
+  $("specNote").textContent = "running speculative vs baseline (loads the 1.5B target on first use — a few seconds)…";
+  fetch(`/api/speculative?prompt=${encodeURIComponent(prompt)}&max_new=64`).then(r => r.json()).then(d => {
+    $("specBtn").disabled = false;
+    if (d.error) { $("specNote").textContent = d.error; return; }
+    $("specHero").textContent = d.tokens_per_pass + "×";
+    $("specViz").innerHTML = d.tokens.map(t =>
+      `<span class="tok" style="background:${t.source === "draft" ? "#1f6f3f" : "#7a4a16"}" ` +
+      `title="${t.source === "draft" ? "draft guess accepted (free)" : "target generated / corrected"}">${escapeHtml(t.text) || "␣"}</span>`
+    ).join("");
+    $("specNote").innerHTML =
+      `<b>${d.n_tokens}</b> tokens from <b>${d.target_passes}</b> target passes = ` +
+      `<b style="color:#3fb950">${d.tokens_per_pass}× tokens per expensive pass</b> (baseline 1.0). ` +
+      `Draft acceptance <b>${d.acceptance_rate}%</b> (K=${d.K}). ` +
+      `Output is <b>${d.identical ? "identical to target-only ✓ (lossless)" : "NOT identical (unexpected!)"}</b>. ` +
+      `Wall-clock here: ${d.spec_s}s vs ${d.baseline_s}s = <b style="color:${d.wall_speedup >= 1 ? "#3fb950" : "#f0883e"}">${d.wall_speedup}×</b> ` +
+      `${d.wall_speedup >= 1 ? "" : "(slower — on a small 1.5B target the draft overhead isn't repaid). "}` +
+      `The fundamental win is real (${d.tokens_per_pass}× fewer expensive target passes, lossless); the <i>wall-clock</i> win needs a large 7B+ target.`;
+  }).catch(e => { $("specBtn").disabled = false; $("specNote").textContent = "Error: " + e; });
+});
+
 drawChart();
 renderTranscript(null);  // show empty-state hint in the transcript box
 renderTokens();          // tokenize the default prompt on load

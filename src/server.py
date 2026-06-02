@@ -653,6 +653,117 @@ def quant_sweep(model_key: str = "qwen25_05b", engine: str = "llamacpp", include
     return {"model": model_key, "model_label": m["label"], "points": points}
 
 
+SPEC_TARGET_ID = "Qwen/Qwen2.5-1.5B-Instruct"   # bigger "target"; draft = the 0.5B
+_spec_target = None
+
+
+def get_spec_target():
+    """Lazily load the 1.5B target for speculative decoding (shares Qwen vocab)."""
+    global _spec_target
+    if _spec_target is None:
+        m = AutoModelForCausalLM.from_pretrained(SPEC_TARGET_ID, dtype=torch.float16)
+        m.to(DEVICE)
+        m.eval()
+        _spec_target = m
+    return _spec_target
+
+
+@torch.no_grad()
+def _greedy_baseline(target, ids, max_new, eos):
+    """Plain greedy decode with the target alone — 1 target forward pass per token."""
+    seq, out, passes = ids, [], 0
+    while len(out) < max_new:
+        nxt = int(target(seq).logits[:, -1, :].argmax(-1))
+        passes += 1
+        out.append(nxt)
+        seq = torch.cat([seq, torch.tensor([[nxt]], device=DEVICE)], dim=1)
+        if nxt == eos:
+            break
+    return out, passes
+
+
+@torch.no_grad()
+def _speculative(target, draft, ids, max_new, eos, K=4):
+    """Greedy speculative decoding. The draft proposes K tokens; the target verifies
+    them in ONE forward pass and accepts the matching prefix (+ its own next token).
+    Lossless vs. greedy target. Records each token's source (draft-accepted / target)."""
+    seq, info, out = ids, [], []
+    passes, drafted, accepted = 0, 0, 0
+    while len(out) < max_new:
+        dseq, drafts = seq, []
+        for _ in range(K):                                  # draft proposes K tokens
+            dt = int(draft(dseq).logits[:, -1, :].argmax(-1))
+            drafts.append(dt)
+            dseq = torch.cat([dseq, torch.tensor([[dt]], device=DEVICE)], dim=1)
+        drafted += K
+        tl = target(torch.cat([seq, torch.tensor([drafts], device=DEVICE)], dim=1)).logits
+        passes += 1                                         # ONE target pass verifies all K
+        L, emit, nacc = seq.shape[1], [], 0
+        for i in range(K):
+            tgt = int(tl[:, L - 1 + i, :].argmax(-1))
+            if tgt == drafts[i]:
+                emit.append((drafts[i], "draft")); nacc += 1
+            else:
+                emit.append((tgt, "target")); break          # first mismatch → target corrects
+        if nacc == K:
+            emit.append((int(tl[:, L - 1 + K, :].argmax(-1)), "target"))  # bonus token
+        accepted += nacc
+        for tid, src in emit:
+            if len(out) >= max_new:
+                break
+            out.append(tid); info.append((tid, src))
+            seq = torch.cat([seq, torch.tensor([[tid]], device=DEVICE)], dim=1)
+            if tid == eos:
+                return info, out, passes, drafted, accepted
+    return info, out, passes, drafted, accepted
+
+
+@app.get("/api/speculative")
+def speculative(prompt: str = "Explain how a CPU executes one instruction, step by step.",
+                max_new: int = 64):
+    """Compare greedy speculative decoding (1.5B target + 0.5B draft) vs target-only.
+    Returns per-token accept/reject for the viz, acceptance rate, tokens-per-target-pass
+    (the real speculative win), a wall-clock comparison, and the lossless check."""
+    if DEVICE != "cuda":
+        return {"error": "speculative decoding demo needs a GPU"}
+    tok = get_tokenizer("qwen25_05b")
+    draft = get_model("qwen25_05b", "fp16")     # 0.5B draft (== the chat model)
+    target = get_spec_target()                  # 1.5B target
+    eos = tok.eos_token_id
+    ids = tok(build_prompt(tok, prompt), return_tensors="pt").input_ids.to(DEVICE)
+
+    t0 = time.perf_counter()
+    info, spec_ids, passes, drafted, accepted = _speculative(target, draft, ids, max_new, eos)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    spec_s = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    base_ids, base_passes = _greedy_baseline(target, ids, max_new, eos)
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    base_s = time.perf_counter() - t0
+
+    toks, prev, acc = [], "", []
+    for tid, src in info:
+        acc.append(tid)
+        full = tok.decode(acc, skip_special_tokens=True)
+        toks.append({"text": full[len(prev):], "source": src})
+        prev = full
+
+    n = len(spec_ids)
+    return {
+        "tokens": toks, "n_tokens": n, "K": 4,
+        "target_passes": passes,
+        "tokens_per_pass": round(n / passes, 2) if passes else 0,
+        "acceptance_rate": round(accepted / drafted * 100, 1) if drafted else 0,
+        "spec_s": round(spec_s, 2), "baseline_s": round(base_s, 2),
+        "wall_speedup": round(base_s / spec_s, 2) if spec_s else 0,
+        "identical": tok.decode(spec_ids, skip_special_tokens=True).strip()
+                     == tok.decode(base_ids, skip_special_tokens=True).strip(),
+    }
+
+
 @app.get("/api/tokenize")
 def tokenize(model_key: str = "qwen25_05b", text: str = ""):
     """Show how a prompt splits into tokens — the units the model actually sees."""
