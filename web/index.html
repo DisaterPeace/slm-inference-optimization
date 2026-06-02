@@ -98,6 +98,16 @@
       <div id="output" class="output"></div>
     </section>
 
+    <!-- ============ PROMPT TOKENIZER ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Prompt tokenizer</h2>
+        <span class="tag">how the model splits your prompt</span>
+      </div>
+      <div id="tokChips" class="tokchips"><span class="hint">type a prompt above to see its tokens</span></div>
+      <div id="tokNote" class="note"></div>
+    </section>
+
     <!-- ============ 2. LIVE TELEMETRY MATRIX ============ -->
     <section class="card wide">
       <div class="card-head">
@@ -113,6 +123,26 @@
           <div class="ro-label">VRAM allocated <span class="hint">live torch reading</span></div>
           <div class="gauge"><div id="vramGaugeFill" class="gauge-fill"></div></div>
           <div id="vramGaugeLabel" class="ro-sub">–</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ MEMORY & TIMING BREAKDOWN ============ -->
+    <section class="card wide">
+      <div class="card-head">
+        <h2>Memory &amp; timing breakdown</h2>
+        <span class="tag">where the VRAM and the time actually go</span>
+      </div>
+      <div class="gen-grid">
+        <div>
+          <h3>KV-cache growth <span class="hint">grows with conversation length</span></h3>
+          <div class="gauge"><div id="kvFill" class="gauge-fill" style="background:#58a6ff"></div></div>
+          <div id="kvNote" class="note">run a turn to see the KV-cache footprint</div>
+        </div>
+        <div>
+          <h3>Prefill vs decode <span class="hint">compute-bound vs memory-bound</span></h3>
+          <div class="splitbar"><div id="pdPrefill" class="seg pf"></div><div id="pdDecode" class="seg dc"></div></div>
+          <div id="pdNote" class="note">run a turn to see the split</div>
         </div>
       </div>
     </section>

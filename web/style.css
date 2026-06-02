@@ -143,6 +143,19 @@ button.danger { background: var(--red); color: #fff; border-color: var(--red); }
 .msg.user { background: #1b2330; border: 1px solid #243042; }
 .msg.assistant { background: #0d1117; border: 1px solid var(--border); }
 
+/* ---- prompt tokenizer chips ---- */
+.tokchips { display: flex; flex-wrap: wrap; gap: 3px; line-height: 1.9; }
+.tokchip { background: #1b2330; border: 1px solid #2a3647; border-radius: 4px;
+  padding: 1px 4px; font-family: "Cascadia Code", "Consolas", monospace; font-size: 12px;
+  white-space: pre; color: #c9d3de; }
+.tokchip:nth-child(even) { background: #20283a; }
+
+/* ---- prefill vs decode split bar ---- */
+.splitbar { display: flex; height: 26px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border); background: #0d1117; margin: 4px 0; }
+.splitbar .seg { height: 100%; transition: width .4s; }
+.splitbar .seg.pf { background: #8957e5; }   /* prefill = compute-bound */
+.splitbar .seg.dc { background: #f0883e; }   /* decode = memory-bound */
+
 /* ---- token confidence heatmap ---- */
 .heatmap {
   background: #0d1117; border: 1px solid var(--border); border-radius: 8px;

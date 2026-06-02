@@ -27,6 +27,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+from paged_attention import KVConfig  # per-token KV-cache byte math
+
 DEFAULT_MODEL_KEY = "qwen25_05b"
 MODEL_SPECS = {
     "qwen25_05b": {
@@ -140,6 +142,20 @@ def get_model(model_key: str = DEFAULT_MODEL_KEY, precision: str = "fp16"):
 
 # load default FP16 at startup so the first request is fast
 get_model(DEFAULT_MODEL_KEY, "fp16")
+
+
+_kv_bpt: dict[str, int] = {}
+
+
+def kv_bytes_per_token(model_key: str) -> int:
+    """Per-token KV-cache size (bytes) for a model, from its real config. Cached."""
+    if model_key not in _kv_bpt:
+        try:
+            spec = _model_spec(model_key)
+            _kv_bpt[model_key] = KVConfig(spec["id"], spec["trust_remote_code"]).bytes_per_token
+        except Exception:
+            _kv_bpt[model_key] = 0
+    return _kv_bpt[model_key]
 
 
 def vram_allocated_mb() -> float:
@@ -407,7 +423,10 @@ async def ws_generate(ws: WebSocket):
         }
 
         req_engine = req.get("engine", "hf")
-        await ws.send_json({"type": "meta", "vram_total_mb": vram_total_mb()})
+        await ws.send_json({
+            "type": "meta", "vram_total_mb": vram_total_mb(),
+            "kv_bytes_per_token": kv_bytes_per_token(model_key),
+        })
 
         if req_engine == "llamacpp":
             # --- llama.cpp (GGUF, CPU) — the edge / on-device engine -----------
@@ -632,6 +651,21 @@ def quant_sweep(model_key: str = "qwen25_05b", engine: str = "llamacpp", include
             "tps": round(ntok / dt, 1) if dt else 0.0,
         })
     return {"model": model_key, "model_label": m["label"], "points": points}
+
+
+@app.get("/api/tokenize")
+def tokenize(model_key: str = "qwen25_05b", text: str = ""):
+    """Show how a prompt splits into tokens — the units the model actually sees."""
+    tok = get_tokenizer(model_key)
+    ids = tok.encode(text, add_special_tokens=False)
+    pieces = [tok.decode([i]) for i in ids]
+    words = len(text.split())
+    return {
+        "count": len(ids),
+        "words": words,
+        "tokens_per_word": round(len(ids) / words, 2) if words else 0,
+        "tokens": pieces,
+    }
 
 
 # static frontend (mounted last so it doesn't shadow /api routes)

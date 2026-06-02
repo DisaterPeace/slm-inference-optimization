@@ -5,6 +5,7 @@ let modelLabels = {
   phi4_mini: "Phi-4 Mini 3.8B",
 };
 let vramTotalMb = 0;
+let kvBytesPerToken = 0;
 
 function modelLabel(key) { return modelLabels[key] || key; }
 function currentModelLabel() {
@@ -166,6 +167,7 @@ function runGeneration(cfg, onToken) {
         if (m.vram_mb != null) updateGauge(m.vram_mb);
       } else if (m.type === "meta") {
         if (m.vram_total_mb) vramTotalMb = m.vram_total_mb;
+        if (m.kv_bytes_per_token) kvBytesPerToken = m.kv_bytes_per_token;
       } else if (m.type === "token") {
         text += m.text;
         tokens.push({ text: m.text, p: m.p != null ? m.p : null });
@@ -345,6 +347,45 @@ function setBusy(b, msg) {
   $("runStatus").textContent = msg || "";
 }
 
+// ---------- memory & timing breakdown ----------
+function renderMemTiming(r) {
+  const ctx = (r.promptTokens || 0) + (r.generated || 0);
+  if (kvBytesPerToken && ctx) {
+    const kvMB = kvBytesPerToken * ctx / 1024 / 1024;
+    const kbTok = kvBytesPerToken / 1024;
+    const win = 4096;                                   // model context window
+    $("kvFill").style.width = Math.min(100, ctx / win * 100).toFixed(1) + "%";
+    const maxCtx = Math.floor(4 * 1024 ** 3 / kvBytesPerToken);  // tokens that fit in a 4 GB KV budget
+    const maxTxt = maxCtx >= 1000 ? (maxCtx / 1000).toFixed(0) + "k" : String(maxCtx);
+    $("kvNote").innerHTML =
+      `<b>${kvMB.toFixed(1)} MB</b> of KV cache for ${ctx} tokens (${kbTok.toFixed(1)} KB/token). ` +
+      `Context window ${ctx}/${win}. A <b>4 GB</b> KV budget fills at ~<b>${maxTxt}</b> tokens — ` +
+      `that's the wall long chats hit, and what PagedAttention stretches.`;
+  }
+  const prefill = r.ttft || 0;
+  const decodeSum = (r.decode || []).reduce((a, b) => a + b, 0);
+  const total = (prefill + decodeSum) || 1;
+  $("pdPrefill").style.width = (prefill / total * 100).toFixed(1) + "%";
+  $("pdDecode").style.width = (decodeSum / total * 100).toFixed(1) + "%";
+  $("pdNote").innerHTML =
+    `Prefill <b>${prefill.toFixed(0)} ms</b> (${(prefill / total * 100).toFixed(0)}%, compute-bound) · ` +
+    `Decode <b>${decodeSum.toFixed(0)} ms</b> (${(decodeSum / total * 100).toFixed(0)}%, memory-bound, ${r.generated || 0} tok). ` +
+    `Longer prompts grow the prefill slice; longer answers grow decode.`;
+}
+
+// ---------- prompt tokenizer ----------
+function renderTokens() {
+  const text = $("prompt").value, model = $("modelSelect").value;
+  if (!text.trim()) { $("tokChips").innerHTML = '<span class="hint">type a prompt above to see its tokens</span>'; $("tokNote").textContent = ""; return; }
+  fetch(`/api/tokenize?model_key=${model}&text=${encodeURIComponent(text)}`).then(r => r.json()).then(d => {
+    $("tokChips").innerHTML = d.tokens.map(t => `<span class="tokchip">${escapeHtml(t) || "␣"}</span>`).join("");
+    $("tokNote").innerHTML =
+      `<b>${d.count}</b> tokens · ${d.words} words · <b>${d.tokens_per_word}</b> tokens/word. ` +
+      `The model sees <i>tokens</i>, not words — this is what fills the context window and sets the prefill cost (TTFT).`;
+  }).catch(() => {});
+}
+const debouncedTokens = debounce(renderTokens, 400);
+
 // ---------- token confidence heatmap ----------
 function confColor(p) {
   // p in [0,1]: red (uncertain) → amber → green (confident)
@@ -427,6 +468,7 @@ function applyEngine() {
 $("engine").addEventListener("change", applyEngine);
 
 $("maxTokens").addEventListener("input", e => $("maxTokensVal").textContent = e.target.value);
+$("prompt").addEventListener("input", debouncedTokens);
 $("precision").addEventListener("change", e => {
   if ($("engine").value === "hf") $("precHint").textContent = PREC_HINT[e.target.value] || "";
 });
@@ -434,6 +476,7 @@ $("precHint").textContent = PREC_HINT.fp16;
 $("modelSelect").addEventListener("change", () => {
   $("deviceSub").textContent = `${currentModelLabel()} · loads on next run`;
   refreshQuantOptions();   // GGUF quant ladder differs per model
+  renderTokens();          // re-tokenize (different models tokenize differently)
 });
 
 // send a chat turn — appends your message, generates with full conversation context
@@ -465,6 +508,7 @@ $("runBtn").addEventListener("click", async () => {
     setStatTable(chartSeries);
     logHistory(label, cfg, r);
     renderHeatmap(r.tokens);
+    renderMemTiming(r);
     if (r.aborted) logLine(`⏹ stopped by user after ${r.generated} tokens`, "err");
     refreshModelInfo();
   } catch (e) {
@@ -686,3 +730,4 @@ drawTradeoff();
 
 drawChart();
 renderTranscript(null);  // show empty-state hint in the transcript box
+renderTokens();          // tokenize the default prompt on load
