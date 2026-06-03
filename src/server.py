@@ -23,7 +23,7 @@ import time
 
 import torch
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -719,27 +719,31 @@ def stream_speculative(target, draft, tokenizer, prompt, max_new_tokens, K=4):
         drafted += K
         tl = target(torch.cat([seq, torch.tensor([drafts], device=DEVICE)], dim=1)).logits
         passes += 1                                         # ONE target pass verifies all K
+        # the target's own probability for each token it endorses — drives both the
+        # accept/reject colours AND the confidence heatmap from this one pass
         L, emit, nacc = seq.shape[1], [], 0
         for i in range(K):
+            probs = torch.softmax(tl[:, L - 1 + i, :], dim=-1)
             tgt = int(tl[:, L - 1 + i, :].argmax(-1))
             if tgt == drafts[i]:
-                emit.append((drafts[i], "draft")); nacc += 1
+                emit.append((drafts[i], "draft", float(probs[0, drafts[i]]))); nacc += 1
             else:
-                emit.append((tgt, "target")); break          # first mismatch → target corrects
+                emit.append((tgt, "target", float(probs[0, tgt]))); break  # mismatch → corrected
         if nacc == K:
-            emit.append((int(tl[:, L - 1 + K, :].argmax(-1)), "target"))  # bonus token
+            bt = int(tl[:, L - 1 + K, :].argmax(-1))         # bonus token
+            emit.append((bt, "target", float(torch.softmax(tl[:, L - 1 + K, :], dim=-1)[0, bt])))
         accepted += nacc
         if DEVICE == "cuda":
             torch.cuda.synchronize()
         per_ms = (time.perf_counter() - t0) * 1000 / max(len(emit), 1)
-        for tid, src in emit:
+        for tid, src, p in emit:
             if n >= max_new_tokens:
                 break
             generated.append(tid)
             seq = torch.cat([seq, torch.tensor([[tid]], device=DEVICE)], dim=1)
             full = tokenizer.decode(generated, skip_special_tokens=True)
             yield {"type": "token", "text": full[len(prev_text):], "dt_ms": per_ms,
-                   "index": n, "source": src}
+                   "index": n, "source": src, "p": p}
             prev_text = full
             n += 1
             if tid == eos:
@@ -770,7 +774,17 @@ def tokenize(model_key: str = "qwen25_05b", text: str = ""):
 # static frontend (mounted last so it doesn't shadow /api routes)
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(WEB_DIR, "index.html"))
+    # Serve the page with the asset URLs cache-busted by their file mtime, so a
+    # redeploy is picked up on the next reload instead of a stale browser/CDN copy
+    # (Cloudflare caches .js/.css aggressively). The HTML itself is never stored.
+    html = open(os.path.join(WEB_DIR, "index.html"), encoding="utf-8").read()
+    for asset in ("app.js", "style.css"):
+        try:
+            v = int(os.path.getmtime(os.path.join(WEB_DIR, asset)))
+        except OSError:
+            v = 0
+        html = html.replace(f"/{asset}", f"/{asset}?v={v}")
+    return HTMLResponse(html, headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 app.mount("/", StaticFiles(directory=WEB_DIR), name="static")
