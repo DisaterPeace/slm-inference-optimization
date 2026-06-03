@@ -173,7 +173,7 @@ function runGeneration(cfg, onToken) {
         if (m.kv_bytes_per_token) kvBytesPerToken = m.kv_bytes_per_token;
       } else if (m.type === "token") {
         text += m.text;
-        tokens.push({ text: m.text, p: m.p != null ? m.p : null });
+        tokens.push({ text: m.text, p: m.p != null ? m.p : null, source: m.source || null });
         if (m.index === 0) ttft = m.dt_ms; else decode.push(m.dt_ms);
         if (onToken) onToken(text, ttft, decode);
       } else if (m.type === "done") {
@@ -550,7 +550,8 @@ $("runBtn").addEventListener("click", async () => {
     logHistory(label, cfg, r);
     renderHeatmap(r.tokens);
     renderMemTiming(r);
-    if (cfg.speculative) logLine(`speculative · 0.5B draft + ${modelLabel(cfg.model)} target · streams in bursts (compare TOTAL time vs spec off — fair KV-cached A/B)`, "in");
+    renderSpeculative(cfg.speculative ? r : null);   // panel reflects THIS run when spec is on
+    if (cfg.speculative && r.spec) logLine(`speculative · ${r.spec.acceptance_rate}% of draft guesses accepted · ${r.spec.tokens_per_pass}× tokens per target pass · lossless`, "in");
     // in single mode, this run becomes the "previous" baseline for the next send
     if (single && !r.aborted) lastSeries = { decode: r.decode, color: "#58a6ff", label: `previous · ${shortTag(cfg)}`, stats: r.stats };
     if (r.aborted) logLine(`⏹ stopped by user after ${r.generated} tokens`, "err");
@@ -772,29 +773,27 @@ $("sweepBtn").addEventListener("click", () => {
 });
 drawTradeoff();
 
-// ---------- SPECULATIVE DECODING ----------
-$("specBtn").addEventListener("click", () => {
-  const prompt = $("prompt").value.trim() || "Explain how a CPU executes one instruction, step by step.";
-  $("specBtn").disabled = true;
-  $("specNote").textContent = "running speculative vs baseline (loads the 1.5B target on first use — a few seconds)…";
-  fetch(`/api/speculative?prompt=${encodeURIComponent(prompt)}&max_new=64`).then(r => r.json()).then(d => {
-    $("specBtn").disabled = false;
-    if (d.error) { $("specNote").textContent = d.error; return; }
-    $("specHero").textContent = d.tokens_per_pass + "×";
-    $("specViz").innerHTML = d.tokens.map(t =>
-      `<span class="tok" style="background:${t.source === "draft" ? "#1f6f3f" : "#7a4a16"}" ` +
-      `title="${t.source === "draft" ? "draft guess accepted (free)" : "target generated / corrected"}">${escapeHtml(t.text) || "␣"}</span>`
-    ).join("");
-    $("specNote").innerHTML =
-      `<b>${d.n_tokens}</b> tokens from <b>${d.target_passes}</b> target passes = ` +
-      `<b style="color:#3fb950">${d.tokens_per_pass}× tokens per expensive pass</b> (baseline 1.0). ` +
-      `Draft acceptance <b>${d.acceptance_rate}%</b> (K=${d.K}). ` +
-      `Output is <b>${d.identical ? "identical to target-only ✓ (lossless)" : "NOT identical (unexpected!)"}</b>. ` +
-      `Wall-clock here: ${d.spec_s}s vs ${d.baseline_s}s = <b style="color:${d.wall_speedup >= 1 ? "#3fb950" : "#f0883e"}">${d.wall_speedup}×</b> ` +
-      `${d.wall_speedup >= 1 ? "" : "(slower — on a small 1.5B target the draft overhead isn't repaid). "}` +
-      `The fundamental win is real (${d.tokens_per_pass}× fewer expensive target passes, lossless); the <i>wall-clock</i> win needs a large 7B+ target.`;
-  }).catch(e => { $("specBtn").disabled = false; $("specNote").textContent = "Error: " + e; });
-});
+// ---------- SPECULATIVE DECODING (visualizes the last spec-toggle run) ----------
+// No prompt of its own: when you send a message with the Speculative toggle ON, this
+// panel paints which tokens the draft guessed right vs. which the target had to correct.
+function renderSpeculative(r) {
+  if (!r || !r.spec || !r.tokens) return;            // only updates on a speculative run
+  const s = r.spec;
+  $("specHero").textContent = s.tokens_per_pass + "×";
+  const colored = r.tokens.filter(t => t.source);
+  $("specViz").innerHTML = colored.length
+    ? colored.map(t =>
+        `<span class="tok" style="background:${t.source === "draft" ? "#1f6f3f" : "#7a4a16"}" ` +
+        `title="${t.source === "draft" ? "draft guess accepted (free)" : "target generated / corrected"}">${escapeHtml(t.text) || "␣"}</span>`
+      ).join("")
+    : `<span class="hint">no per-token detail for this run</span>`;
+  $("specNote").innerHTML =
+    `<b>${r.generated}</b> tokens from <b>${s.passes}</b> target passes = ` +
+    `<b style="color:#3fb950">${s.tokens_per_pass}× tokens per expensive pass</b> (baseline 1.0). ` +
+    `Draft acceptance <b>${s.acceptance_rate}%</b> (K=${s.K}). Output is <b style="color:#3fb950">lossless</b> ` +
+    `(byte-for-byte what the target alone would emit). The per-pass number is the real speculative win; ` +
+    `<i>wall-clock</i> only beats plain decode once the target is large (7B+) — on this 1.5B it's slower, the honest result.`;
+}
 
 drawChart();
 renderTranscript(null);  // show empty-state hint in the transcript box

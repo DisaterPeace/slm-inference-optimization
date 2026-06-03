@@ -25,7 +25,7 @@ import torch
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from paged_attention import KVConfig  # per-token KV-cache byte math
 
@@ -481,17 +481,17 @@ async def ws_generate(ws: WebSocket):
             else:
                 prompt = build_prompt(tokenizer, req.get("prompt", "Hello!"), system)
 
-            if is_spec_target:
-                # the target model always runs via HF generate() so speculative ON vs
-                # OFF is a fair, KV-cached wall-clock A/B (same code path either way)
+            if use_spec:
+                # speculative ON: the 0.5B drafts, the 1.5B target verifies — streamed
+                # per-token (with each token's source) so the panel below shows accept/
+                # reject for THIS run. Off → falls through to the normal decode path.
                 target = get_model(model_key, "fp16")
-                draft = get_draft() if use_spec else None
-                await log(f"model ready · {spec['short']}"
-                          f"{' + 0.5B draft (speculative)' if use_spec else ' (target alone)'} · "
+                draft = get_draft()
+                await log(f"model ready · {spec['short']} target + 0.5B draft (speculative) · "
                           f"VRAM {vram_allocated_mb():.0f} MB")
 
                 def make_gen():
-                    return stream_hf_generate(target, draft, tokenizer, prompt, max_new)
+                    return stream_speculative(target, draft, tokenizer, prompt, max_new)
             else:
                 model = get_model(model_key, precision)
                 footprint = _footprint_mb.get((model_key, precision), 0.0)
@@ -695,27 +695,22 @@ def get_draft():
 
 
 @torch.no_grad()
-def _greedy_baseline(target, ids, max_new, eos):
-    """Plain greedy decode with the target alone — 1 target forward pass per token."""
-    seq, out, passes = ids, [], 0
-    while len(out) < max_new:
-        nxt = int(target(seq).logits[:, -1, :].argmax(-1))
-        passes += 1
-        out.append(nxt)
-        seq = torch.cat([seq, torch.tensor([[nxt]], device=DEVICE)], dim=1)
-        if nxt == eos:
-            break
-    return out, passes
+def stream_speculative(target, draft, tokenizer, prompt, max_new_tokens, K=4):
+    """Streaming greedy speculative decoding — the live Speculative toggle.
 
-
-@torch.no_grad()
-def _speculative(target, draft, ids, max_new, eos, K=4):
-    """Greedy speculative decoding. The draft proposes K tokens; the target verifies
-    them in ONE forward pass and accepts the matching prefix (+ its own next token).
-    Lossless vs. greedy target. Records each token's source (draft-accepted / target)."""
-    seq, info, out = ids, [], []
+    The 0.5B *draft* proposes K tokens; the 1.5B *target* verifies them all in ONE
+    forward pass and keeps the matching prefix (plus its own next token). Lossless vs.
+    greedy target. Each token is emitted with its `source` — 'draft' (the draft guessed
+    right, free) or 'target' (the target had to correct it) — so the bottom panel can
+    paint accept/reject for *this* run. The done event carries the acceptance rate and
+    tokens-per-target-pass (the real speculative win)."""
+    ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+    prompt_len = ids.shape[1]
+    eos = tokenizer.eos_token_id
+    seq, generated, prev_text, n = ids, [], "", 0
     passes, drafted, accepted = 0, 0, 0
-    while len(out) < max_new:
+    while n < max_new_tokens:
+        t0 = time.perf_counter()
         dseq, drafts = seq, []
         for _ in range(K):                                  # draft proposes K tokens
             dt = int(draft(dseq).logits[:, -1, :].argmax(-1))
@@ -734,105 +729,27 @@ def _speculative(target, draft, ids, max_new, eos, K=4):
         if nacc == K:
             emit.append((int(tl[:, L - 1 + K, :].argmax(-1)), "target"))  # bonus token
         accepted += nacc
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
+        per_ms = (time.perf_counter() - t0) * 1000 / max(len(emit), 1)
         for tid, src in emit:
-            if len(out) >= max_new:
+            if n >= max_new_tokens:
                 break
-            out.append(tid); info.append((tid, src))
+            generated.append(tid)
             seq = torch.cat([seq, torch.tensor([[tid]], device=DEVICE)], dim=1)
+            full = tokenizer.decode(generated, skip_special_tokens=True)
+            yield {"type": "token", "text": full[len(prev_text):], "dt_ms": per_ms,
+                   "index": n, "source": src}
+            prev_text = full
+            n += 1
             if tid == eos:
-                return info, out, passes, drafted, accepted
-    return info, out, passes, drafted, accepted
-
-
-class _CountingStreamer(TextIteratorStreamer):
-    """TextIteratorStreamer that also counts the real generated token ids (the text
-    stream alone can't be re-tokenized reliably)."""
-
-    def __init__(self, *a, **k):
-        super().__init__(*a, **k)
-        self.gen_tokens = 0
-
-    def put(self, value):
-        v = value[0] if value.dim() > 1 else value
-        if not (self.skip_prompt and self.next_tokens_are_prompt):
-            self.gen_tokens += int(v.shape[-1])
-        super().put(value)
-
-
-@torch.no_grad()
-def stream_hf_generate(model, assistant, tokenizer, prompt, max_new_tokens):
-    """Stream via HuggingFace generate() (KV-cached). `assistant` set → speculative
-    (assisted generation). Used for the speculative-TARGET model on both spec on AND
-    off, so the on-vs-off comparison is a FAIR wall-clock A/B (identical code path).
-    Speculative emits tokens in bursts, so the per-token curve is burst-granular —
-    compare TOTAL time. Token count is exact via the counting streamer."""
-    ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
-    prompt_len = ids.shape[1]
-    streamer = _CountingStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    kwargs = dict(input_ids=ids, max_new_tokens=max_new_tokens, do_sample=False,
-                  streamer=streamer, pad_token_id=tokenizer.eos_token_id)
-    if assistant is not None:
-        kwargs["assistant_model"] = assistant
-    th = threading.Thread(target=model.generate, kwargs=kwargs, daemon=True)
-    th.start()
-    chunks, last = 0, time.perf_counter()
-    for text in streamer:
-        if not text:
-            continue
-        now = time.perf_counter()
-        dt = (now - last) * 1000
-        last = now
-        yield {"type": "token", "text": text, "dt_ms": dt, "index": chunks}
-        chunks += 1
-    th.join()
-    yield {"type": "done", "prompt_tokens": prompt_len, "generated": streamer.gen_tokens,
-           "vram_mb": vram_allocated_mb()}
-
-
-@app.get("/api/speculative")
-def speculative(prompt: str = "Explain how a CPU executes one instruction, step by step.",
-                max_new: int = 64):
-    """Compare greedy speculative decoding (1.5B target + 0.5B draft) vs target-only.
-    Returns per-token accept/reject for the viz, acceptance rate, tokens-per-target-pass
-    (the real speculative win), a wall-clock comparison, and the lossless check."""
-    if DEVICE != "cuda":
-        return {"error": "speculative decoding demo needs a GPU"}
-    tok = get_tokenizer("qwen25_05b")
-    draft = get_draft()                          # 0.5B draft (resident separately)
-    target = get_model("qwen25_15b", "fp16")     # 1.5B target (also a chat model)
-    eos = tok.eos_token_id
-    ids = tok(build_prompt(tok, prompt), return_tensors="pt").input_ids.to(DEVICE)
-
-    t0 = time.perf_counter()
-    info, spec_ids, passes, drafted, accepted = _speculative(target, draft, ids, max_new, eos)
-    if DEVICE == "cuda":
-        torch.cuda.synchronize()
-    spec_s = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    base_ids, base_passes = _greedy_baseline(target, ids, max_new, eos)
-    if DEVICE == "cuda":
-        torch.cuda.synchronize()
-    base_s = time.perf_counter() - t0
-
-    toks, prev, acc = [], "", []
-    for tid, src in info:
-        acc.append(tid)
-        full = tok.decode(acc, skip_special_tokens=True)
-        toks.append({"text": full[len(prev):], "source": src})
-        prev = full
-
-    n = len(spec_ids)
-    return {
-        "tokens": toks, "n_tokens": n, "K": 4,
-        "target_passes": passes,
-        "tokens_per_pass": round(n / passes, 2) if passes else 0,
-        "acceptance_rate": round(accepted / drafted * 100, 1) if drafted else 0,
-        "spec_s": round(spec_s, 2), "baseline_s": round(base_s, 2),
-        "wall_speedup": round(base_s / spec_s, 2) if spec_s else 0,
-        "identical": tok.decode(spec_ids, skip_special_tokens=True).strip()
-                     == tok.decode(base_ids, skip_special_tokens=True).strip(),
-    }
+                n = max_new_tokens
+                break
+    acc_rate = round(accepted / drafted * 100, 1) if drafted else 0
+    yield {"type": "done", "prompt_tokens": prompt_len, "generated": len(generated),
+           "vram_mb": vram_allocated_mb(),
+           "spec": {"acceptance_rate": acc_rate, "passes": passes, "K": K,
+                    "tokens_per_pass": round(len(generated) / passes, 2) if passes else 0}}
 
 
 @app.get("/api/tokenize")

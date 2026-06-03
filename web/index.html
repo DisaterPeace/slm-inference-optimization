@@ -232,21 +232,21 @@
     <section class="card wide">
       <div class="card-head">
         <h2>Speculative decoding</h2>
-        <span class="tag">draft proposes · target verifies · HF · Qwen 1.5B + 0.5B</span>
-        <button id="specBtn" class="ghost mini">Run</button>
+        <span class="tag">reflects your last run with the Speculative toggle ON</span>
       </div>
       <div class="why">
         <span class="q">How it works</span>
-        A small <b>draft</b> (Qwen 0.5B) cheaply guesses the next few tokens; the big <b>target</b>
-        (Qwen 1.5B) verifies them all in <b>one</b> forward pass and keeps the matching run (plus its own
-        next token). It's <b>lossless</b> — byte-for-byte what the target alone would produce. Below:
+        Turn the <b>Speculative</b> toggle on (with the <b>Qwen 1.5B</b> target) and send a prompt. A small
+        <b>draft</b> (Qwen 0.5B) cheaply guesses the next few tokens; the big <b>target</b> verifies them all
+        in <b>one</b> forward pass and keeps the matching run (plus its own next token). It's <b>lossless</b> —
+        byte-for-byte what the target alone would produce. Below, that run is painted token-by-token:
         <b style="color:#3fb950">green = the draft's guess was accepted (free)</b>,
         <b style="color:#f0883e">amber = the target had to correct it</b>. The real win is
         <b>tokens per expensive target pass</b>; wall-clock only beats baseline when the target is large —
-        on a 1.5B it's ~break-even (the honest result).
+        on a 1.5B it's slower (the honest result).
       </div>
       <div class="headline"><span id="specHero" class="hero">–</span><span class="hero-sub">tokens per target forward pass (baseline = 1.0)</span></div>
-      <div id="specViz" class="heatmap"><span class="hint">run to see which tokens the draft guessed right (loads the 1.5B target on first use)</span></div>
+      <div id="specViz" class="heatmap"><span class="hint">turn on the Speculative toggle (with Qwen 1.5B) and send a prompt to see which tokens the draft guessed right</span></div>
       <div id="specNote" class="note"></div>
     </section>
 
