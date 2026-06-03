@@ -531,7 +531,8 @@ $("runBtn").addEventListener("click", async () => {
   renderTranscript("");
   userStopped = false;
   setBusy(true, `generating (${label})…`);
-  const turn = single ? "single" : `turn ${Math.ceil(chatMessages.length / 2)}`;
+  if (single) logLine("🧹 standalone — previous context cleared; run history kept below", "in");
+  const turn = single ? "standalone" : `turn ${Math.ceil(chatMessages.length / 2)}`;
   logLine(`▶ ${turn} · ${modelLabel(cfg.model)} · ${cfg.precision.toUpperCase()} · ${label} · ${cfg.maxTokens} tok`, "in");
 
   const cur = { decode: [], color, label: `current · ${shortTag(cfg)}`, stats: null };
