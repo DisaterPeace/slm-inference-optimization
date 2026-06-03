@@ -14,31 +14,41 @@ function currentModelLabel() {
 }
 
 // ---------- device info ----------
+let modelInfoInit = false;   // controls run ONCE; later refreshes must not reset them
 function applyModelInfo(d) {
   $("device").textContent = d.device;
-  if (d.models && $("modelSelect")) {
-    modelLabels = Object.fromEntries(d.models.map(m => [m.key, m.label]));
-    $("modelSelect").innerHTML = d.models.map(m =>
-      `<option value="${m.key}" ${m.key === d.active_model ? "selected" : ""}>${m.label}</option>`
-    ).join("");
-  }
-  const active = (d.models || []).find(m => m.key === d.active_model);
-  if (active) {
-    const parts = [active.label];
-    if (active.fp16_mb) parts.push(`FP16 ${active.fp16_mb.toFixed(0)} MB`);
-    if (active.int8_mb) parts.push(`INT8 ${active.int8_mb.toFixed(0)} MB`);
-    if (active.nf4_mb) parts.push(`NF4 ${active.nf4_mb.toFixed(0)} MB`);
-    $("deviceSub").textContent = parts.join(" · ");
-  }
-  if (d.llama_models) {
-    llamaModels = Object.fromEntries(d.llama_models.map(m => [m.key, m.quants]));
-    if ($("sweepModel") && !$("sweepModel").options.length) {
+  // static reference data — safe to refresh anytime (doesn't touch the controls)
+  if (d.models) modelLabels = Object.fromEntries(d.models.map(m => [m.key, m.label]));
+  if (d.llama_models) llamaModels = Object.fromEntries(d.llama_models.map(m => [m.key, m.quants]));
+  if (d.spec_targets) specTargets = d.spec_targets;
+
+  // Build the dropdowns + engine layout exactly ONCE. refreshModelInfo() runs after
+  // every generation to refresh VRAM/footprints — rebuilding the selects there would
+  // wipe the user's quantization / model / cache / speculative choices mid-session.
+  if (!modelInfoInit) {
+    if (d.models && $("modelSelect")) {
+      $("modelSelect").innerHTML = d.models.map(m =>
+        `<option value="${m.key}" ${m.key === d.active_model ? "selected" : ""}>${m.label}</option>`
+      ).join("");
+    }
+    if (d.llama_models && $("sweepModel") && !$("sweepModel").options.length) {
       $("sweepModel").innerHTML = d.llama_models.map(m => `<option value="${m.key}">${m.label}</option>`).join("");
     }
+    if ($("engine")) applyEngine();
+    if ($("specToggle")) updateSpecToggle();
+    modelInfoInit = true;
   }
-  if (d.spec_targets) specTargets = d.spec_targets;
-  if ($("engine")) applyEngine();
-  if ($("specToggle")) updateSpecToggle();
+
+  // footprint line for the CURRENTLY selected model (updates as sizes get measured)
+  const selKey = ($("modelSelect") && $("modelSelect").value) || d.active_model;
+  const cur = (d.models || []).find(m => m.key === selKey);
+  if (cur) {
+    const parts = [cur.label];
+    if (cur.fp16_mb) parts.push(`FP16 ${cur.fp16_mb.toFixed(0)} MB`);
+    if (cur.int8_mb) parts.push(`INT8 ${cur.int8_mb.toFixed(0)} MB`);
+    if (cur.nf4_mb) parts.push(`NF4 ${cur.nf4_mb.toFixed(0)} MB`);
+    $("deviceSub").textContent = parts.join(" · ");
+  }
 }
 function refreshModelInfo() {
   return fetch("/api/model_info")
@@ -457,15 +467,19 @@ function updateSpecToggle() {
   }
 }
 
-// repopulate the quantization dropdown for the current engine + model
+// repopulate the quantization dropdown for the current engine + model,
+// keeping the user's current choice whenever it's still a valid option
 function refreshQuantOptions() {
+  const prev = $("precision").value;
   if ($("engine").value === "llamacpp") {
     const qs = llamaModels[$("modelSelect").value] || [{ key: "q4_k_m", label: "Q4_K_M · 4-bit" }];
     $("precision").innerHTML = qs.map(q => `<option value="${q.key}">${q.label}</option>`).join("");
-    if (qs.find(q => q.key === "q4_k_m")) $("precision").value = "q4_k_m";
+    $("precision").value = qs.find(q => q.key === prev) ? prev
+      : (qs.find(q => q.key === "q4_k_m") ? "q4_k_m" : qs[0].key);
     $("precHint").textContent = "GGUF · down to 2-bit (CPU only)";
   } else {
     $("precision").innerHTML = HF_PRECISIONS.map(([v, l]) => `<option value="${v}">${l}</option>`).join("");
+    if (HF_PRECISIONS.find(([v]) => v === prev)) $("precision").value = prev;
     $("precHint").textContent = PREC_HINT[$("precision").value] || "";
   }
 }
