@@ -45,11 +45,12 @@ FastAPI + WebSocket backend with a dependency-free vanilla-JS dashboard.
 - **Token confidence heatmap** — each generated token shaded by the model's
   probability for it (green=confident → red=uncertain), surfacing where the model
   was "deciding" vs. emitting boilerplate. HuggingFace engine.
-- **Speculative decoding** — a 0.5B draft proposes, a 1.5B target verifies; each
-  token is shown as draft-accepted (green) or target-corrected (amber), with the
-  acceptance rate and **tokens-per-target-pass** (the real win), proven lossless.
-  Honest finding: ~3× fewer target passes but ~break-even wall-clock on a small
-  target — the wall-clock win needs a 7B+ target.
+- **Speculative decoding** — two ways: a dedicated panel (0.5B draft proposes, 1.5B
+  target verifies) shows each token as draft-accepted (green) / target-corrected
+  (amber) with acceptance rate and **tokens-per-target-pass**; and a **live toggle**
+  on the bigger Qwen target (a fair, KV-cached on/off A/B via HF assisted generation).
+  Proven lossless. Honest finding: ~3× fewer target passes but *slower* wall-clock on
+  a small target — the wall-clock win needs a 7B+ target.
 - **Event console** — raw server events (model load, prefill/TTFT, decode mode)
   streamed live.
 

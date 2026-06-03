@@ -36,7 +36,9 @@ function applyModelInfo(d) {
       $("sweepModel").innerHTML = d.llama_models.map(m => `<option value="${m.key}">${m.label}</option>`).join("");
     }
   }
+  if (d.spec_targets) specTargets = d.spec_targets;
   if ($("engine")) applyEngine();
+  if ($("specToggle")) updateSpecToggle();
 }
 function refreshModelInfo() {
   return fetch("/api/model_info")
@@ -158,6 +160,7 @@ function runGeneration(cfg, onToken) {
       model: cfg.model,
       engine: cfg.engine,
       mmap: cfg.mmap,
+      speculative: cfg.speculative,
     }));
 
     ws.onmessage = (ev) => {
@@ -175,7 +178,7 @@ function runGeneration(cfg, onToken) {
         if (onToken) onToken(text, ttft, decode);
       } else if (m.type === "done") {
         if (m.vram_mb != null) updateGauge(m.vram_mb);
-        finish({ promptTokens: m.prompt_tokens, generated: m.generated, aborted: false });
+        finish({ promptTokens: m.prompt_tokens, generated: m.generated, aborted: false, spec: m.spec });
         ws.close();
       } else if (m.type === "error") {
         if (!settled) { settled = true; activeWs = null; reject(new Error(m.message)); }
@@ -334,6 +337,7 @@ function readCfg(useCacheOverride) {
     model: $("modelSelect").value,
     engine: $("engine").value,
     mmap: $("mmapMode") ? $("mmapMode").value === "mmap" : true,
+    speculative: $("specToggle") && !$("specToggle").disabled && $("specToggle").value === "on",
   };
 }
 function setBusy(b, msg) {
@@ -438,6 +442,20 @@ const HF_PRECISIONS = [
   ["nf4", "4-bit NF4 — weight-only (real)"],
 ];
 let llamaModels = {};  // { modelKey: [{key,label}] } filled from /api/model_info
+let specTargets = [];  // model keys that can be a speculative target (have a draft)
+
+// the Speculative toggle is only usable for a bigger Qwen target on the HF engine
+function updateSpecToggle() {
+  const m = $("modelSelect").value, hf = $("engine").value === "hf";
+  const ok = hf && specTargets.includes(m);
+  $("specToggle").disabled = !ok;
+  if (!ok) {
+    $("specToggle").value = "off";
+    $("specHint").textContent = hf ? "pick a bigger Qwen target (1.5B)" : "HuggingFace only";
+  } else {
+    $("specHint").textContent = "0.5B draft · honest: slower on 1.5B (win needs 7B+)";
+  }
+}
 
 // repopulate the quantization dropdown for the current engine + model
 function refreshQuantOptions() {
@@ -464,6 +482,7 @@ function applyEngine() {
   const why = llama ? "HuggingFace only — llama.cpp always uses its KV cache" : "";
   $("abBtn").title = why; $("optBtn").title = why;
   refreshQuantOptions();
+  updateSpecToggle();
 }
 $("engine").addEventListener("change", applyEngine);
 
@@ -476,6 +495,7 @@ $("precHint").textContent = PREC_HINT.fp16;
 $("modelSelect").addEventListener("change", () => {
   $("deviceSub").textContent = `${currentModelLabel()} · loads on next run`;
   refreshQuantOptions();   // GGUF quant ladder differs per model
+  updateSpecToggle();      // speculative needs a bigger Qwen target
   renderTokens();          // re-tokenize (different models tokenize differently)
 });
 $("chatMode").addEventListener("change", () => {
@@ -494,6 +514,7 @@ $("chatMode").addEventListener("change", () => {
 //            PREVIOUS run overlaid so every send is an automatic A/B
 let lastSeries = null;  // previous run's curve, kept for single-message comparison
 function shortTag(cfg) {
+  if (cfg.speculative) return `${modelLabel(cfg.model)} +spec`;
   return `${cfg.precision.toUpperCase()} ${cfg.useCache ? "KV" : "naive"}`;
 }
 $("runBtn").addEventListener("click", async () => {
@@ -529,6 +550,7 @@ $("runBtn").addEventListener("click", async () => {
     logHistory(label, cfg, r);
     renderHeatmap(r.tokens);
     renderMemTiming(r);
+    if (cfg.speculative) logLine(`speculative · 0.5B draft + ${modelLabel(cfg.model)} target · streams in bursts (compare TOTAL time vs spec off — fair KV-cached A/B)`, "in");
     // in single mode, this run becomes the "previous" baseline for the next send
     if (single && !r.aborted) lastSeries = { decode: r.decode, color: "#58a6ff", label: `previous · ${shortTag(cfg)}`, stats: r.stats };
     if (r.aborted) logLine(`⏹ stopped by user after ${r.generated} tokens`, "err");

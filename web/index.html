@@ -71,6 +71,14 @@
           <span class="ctrl-hint">reuse vs recompute past tokens</span>
         </label>
 
+        <label>Speculative
+          <select id="specToggle" disabled>
+            <option value="off">Off</option>
+            <option value="on">On — 0.5B draft</option>
+          </select>
+          <span class="ctrl-hint" id="specHint">pick a bigger Qwen target</span>
+        </label>
+
         <label id="mmapWrap" style="display:none">Memory load
           <select id="mmapMode">
             <option value="mmap">mmap — zero-copy</option>

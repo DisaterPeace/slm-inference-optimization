@@ -25,7 +25,7 @@ import torch
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextIteratorStreamer
 
 from paged_attention import KVConfig  # per-token KV-cache byte math
 
@@ -36,6 +36,13 @@ MODEL_SPECS = {
         "label": "Qwen2.5 0.5B",
         "short": "Qwen 0.5B",
         "params": "0.5B",
+        "trust_remote_code": False,
+    },
+    "qwen25_15b": {
+        "id": "Qwen/Qwen2.5-1.5B-Instruct",
+        "label": "Qwen2.5 1.5B",
+        "short": "Qwen 1.5B",
+        "params": "1.5B",
         "trust_remote_code": False,
     },
     "phi4_mini": {
@@ -456,8 +463,12 @@ async def ws_generate(ws: WebSocket):
         else:
             # --- HuggingFace / transformers (GPU) ------------------------------
             spec = _model_spec(model_key)
+            is_spec_target = model_key in SPEC_DRAFT
+            use_spec = bool(req.get("speculative", False)) and is_spec_target
             cache_eng = "KV-cache (O(N))" if use_cache else "naive recompute (O(N²))"
-            await log(f"pipeline start · {spec['short']} · {precision.upper()} · {cache_eng} · greedy · {max_new} tok")
+            decode_lbl = "speculative (0.5B draft)" if use_spec else (
+                "target alone" if is_spec_target else cache_eng)
+            await log(f"pipeline start · {spec['short']} · {precision.upper()} · {decode_lbl} · greedy · {max_new} tok")
             if (model_key, precision) not in _models:
                 await log(f"loading {spec['id']} [{precision}] → VRAM (first use)…")
             tokenizer = get_tokenizer(model_key)
@@ -469,12 +480,25 @@ async def ws_generate(ws: WebSocket):
                 await log(f"context · {len(full)} messages in conversation")
             else:
                 prompt = build_prompt(tokenizer, req.get("prompt", "Hello!"), system)
-            model = get_model(model_key, precision)
-            footprint = _footprint_mb.get((model_key, precision), 0.0)
-            await log(f"model ready · weights {footprint:.0f} MB · VRAM allocated {vram_allocated_mb():.0f} MB")
 
-            def make_gen():
-                return stream_generate(model, tokenizer, prompt, max_new, use_cache, pinned, params)
+            if is_spec_target:
+                # the target model always runs via HF generate() so speculative ON vs
+                # OFF is a fair, KV-cached wall-clock A/B (same code path either way)
+                target = get_model(model_key, "fp16")
+                draft = get_draft() if use_spec else None
+                await log(f"model ready · {spec['short']}"
+                          f"{' + 0.5B draft (speculative)' if use_spec else ' (target alone)'} · "
+                          f"VRAM {vram_allocated_mb():.0f} MB")
+
+                def make_gen():
+                    return stream_hf_generate(target, draft, tokenizer, prompt, max_new)
+            else:
+                model = get_model(model_key, precision)
+                footprint = _footprint_mb.get((model_key, precision), 0.0)
+                await log(f"model ready · weights {footprint:.0f} MB · VRAM allocated {vram_allocated_mb():.0f} MB")
+
+                def make_gen():
+                    return stream_generate(model, tokenizer, prompt, max_new, use_cache, pinned, params)
 
         # --- run the blocking generation in a worker THREAD ---------------------
         # Generation is GPU/CPU-bound; running it directly in the async handler
@@ -553,6 +577,7 @@ def model_info():
         "int8_mb": footprint(active, "int8"),
         "nf4_mb": footprint(active, "nf4"),
         "device": torch.cuda.get_device_name(0) if DEVICE == "cuda" else "CPU",
+        "spec_targets": list(SPEC_DRAFT.keys()),
         "llama_models": [
             {"key": mk, "label": m["label"],
              "quants": [{"key": qk, "label": lbl} for qk, (lbl, _) in m["quants"].items()]}
@@ -653,19 +678,20 @@ def quant_sweep(model_key: str = "qwen25_05b", engine: str = "llamacpp", include
     return {"model": model_key, "model_label": m["label"], "points": points}
 
 
-SPEC_TARGET_ID = "Qwen/Qwen2.5-1.5B-Instruct"   # bigger "target"; draft = the 0.5B
-_spec_target = None
+# Speculative decoding: which chat models can act as a "target" and the draft to use.
+# Target + draft must share a vocabulary, so only same-family Qwen pairs qualify.
+SPEC_DRAFT = {"qwen25_15b": "qwen25_05b"}
+_draft_model = None
 
 
-def get_spec_target():
-    """Lazily load the 1.5B target for speculative decoding (shares Qwen vocab)."""
-    global _spec_target
-    if _spec_target is None:
-        m = AutoModelForCausalLM.from_pretrained(SPEC_TARGET_ID, dtype=torch.float16)
-        m.to(DEVICE)
-        m.eval()
-        _spec_target = m
-    return _spec_target
+def get_draft():
+    """The 0.5B draft, kept resident separately so loading the target (which evicts
+    the regular model cache) doesn't drop it. Both fit easily in 8 GB."""
+    global _draft_model
+    if _draft_model is None:
+        did = MODEL_SPECS["qwen25_05b"]["id"]
+        _draft_model = AutoModelForCausalLM.from_pretrained(did, dtype=torch.float16).to(DEVICE).eval()
+    return _draft_model
 
 
 @torch.no_grad()
@@ -718,6 +744,51 @@ def _speculative(target, draft, ids, max_new, eos, K=4):
     return info, out, passes, drafted, accepted
 
 
+class _CountingStreamer(TextIteratorStreamer):
+    """TextIteratorStreamer that also counts the real generated token ids (the text
+    stream alone can't be re-tokenized reliably)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.gen_tokens = 0
+
+    def put(self, value):
+        v = value[0] if value.dim() > 1 else value
+        if not (self.skip_prompt and self.next_tokens_are_prompt):
+            self.gen_tokens += int(v.shape[-1])
+        super().put(value)
+
+
+@torch.no_grad()
+def stream_hf_generate(model, assistant, tokenizer, prompt, max_new_tokens):
+    """Stream via HuggingFace generate() (KV-cached). `assistant` set → speculative
+    (assisted generation). Used for the speculative-TARGET model on both spec on AND
+    off, so the on-vs-off comparison is a FAIR wall-clock A/B (identical code path).
+    Speculative emits tokens in bursts, so the per-token curve is burst-granular —
+    compare TOTAL time. Token count is exact via the counting streamer."""
+    ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+    prompt_len = ids.shape[1]
+    streamer = _CountingStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    kwargs = dict(input_ids=ids, max_new_tokens=max_new_tokens, do_sample=False,
+                  streamer=streamer, pad_token_id=tokenizer.eos_token_id)
+    if assistant is not None:
+        kwargs["assistant_model"] = assistant
+    th = threading.Thread(target=model.generate, kwargs=kwargs, daemon=True)
+    th.start()
+    chunks, last = 0, time.perf_counter()
+    for text in streamer:
+        if not text:
+            continue
+        now = time.perf_counter()
+        dt = (now - last) * 1000
+        last = now
+        yield {"type": "token", "text": text, "dt_ms": dt, "index": chunks}
+        chunks += 1
+    th.join()
+    yield {"type": "done", "prompt_tokens": prompt_len, "generated": streamer.gen_tokens,
+           "vram_mb": vram_allocated_mb()}
+
+
 @app.get("/api/speculative")
 def speculative(prompt: str = "Explain how a CPU executes one instruction, step by step.",
                 max_new: int = 64):
@@ -727,8 +798,8 @@ def speculative(prompt: str = "Explain how a CPU executes one instruction, step 
     if DEVICE != "cuda":
         return {"error": "speculative decoding demo needs a GPU"}
     tok = get_tokenizer("qwen25_05b")
-    draft = get_model("qwen25_05b", "fp16")     # 0.5B draft (== the chat model)
-    target = get_spec_target()                  # 1.5B target
+    draft = get_draft()                          # 0.5B draft (resident separately)
+    target = get_model("qwen25_15b", "fp16")     # 1.5B target (also a chat model)
     eos = tok.eos_token_id
     ids = tok(build_prompt(tok, prompt), return_tensors="pt").input_ids.to(DEVICE)
 
