@@ -8,10 +8,6 @@ on the GPU, and any two runs diffable side by side.
 Built around `Qwen2.5-0.5B-Instruct` and `Phi-4-mini-3.8B`, served through a
 FastAPI + WebSocket backend with a dependency-free vanilla-JS dashboard.
 
-> **Design principle: measure honestly, label clearly.** Every knob in the UI
-> changes the *live* forward pass and every metric is measured on the GPU.
-> LLM decode is **memory-bandwidth-bound**, so the playground is built to reveal
-
 ---
 
 ## Features
