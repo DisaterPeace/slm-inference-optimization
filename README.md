@@ -11,10 +11,6 @@ FastAPI + WebSocket backend with a dependency-free vanilla-JS dashboard.
 > **Design principle: measure honestly, label clearly.** Every knob in the UI
 > changes the *live* forward pass and every metric is measured on the GPU.
 > LLM decode is **memory-bandwidth-bound**, so the playground is built to reveal
-> *where each optimization does and doesn't pay off* — including honest results
-> like "4-bit buys memory, not speed, on a small model." Engine-level techniques
-> that HuggingFace doesn't expose (PagedAttention, fused kernels) are named as
-> such rather than faked.
 
 ---
 
